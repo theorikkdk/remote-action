@@ -1,0 +1,44 @@
+{
+  "id": "remote-action",
+  "title": "Remote Action",
+  "description": "MVP skeleton for relaying remote actions in DnD5e through socketlib.",
+  "version": "0.1.0",
+  "authors": [
+    {
+      "name": "Codex"
+    }
+  ],
+  "compatibility": {
+    "minimum": "12",
+    "verified": "13"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system"
+      }
+    ],
+    "requires": [
+      {
+        "id": "socketlib",
+        "type": "module"
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "languages/en.json"
+    },
+    {
+      "lang": "fr",
+      "name": "Francais",
+      "path": "languages/fr.json"
+    }
+  ]
+}

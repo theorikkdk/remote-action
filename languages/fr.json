@@ -1,0 +1,22 @@
+{
+  "REMOTE_ACTION": {
+    "Settings": {
+      "NoUser": "Aucun utilisateur",
+      "PrimaryReceiver": {
+        "Name": "Recepteur principal",
+        "Hint": "Utilisateur qui recevra les actions distantes."
+      },
+      "AuthorizedSenders": {
+        "Name": "Emetteurs autorises",
+        "Hint": "Liste des IDs utilisateurs autorises a emettre des actions, separes par des virgules pour ce MVP."
+      },
+      "Debug": {
+        "Name": "Mode debug",
+        "Hint": "Active des logs supplementaires dans la console."
+      }
+    },
+    "Errors": {
+      "Dnd5eOnly": "Remote Action fonctionne uniquement avec le systeme DnD5e."
+    }
+  }
+}
