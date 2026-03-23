@@ -25,7 +25,10 @@ export function registerSocket() {
     executeRemoteAction
   );
 
-  logDebug("Socket registered", SOCKET_NAME);
+  logDebug("Socket registered.", {
+    socketName: SOCKET_NAME,
+    socketAvailable: Boolean(remoteActionSocket)
+  });
   return remoteActionSocket;
 }
 

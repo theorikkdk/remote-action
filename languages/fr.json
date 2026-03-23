@@ -1,14 +1,40 @@
 {
   "REMOTE_ACTION": {
+    "Common": {
+      "Yes": "Oui",
+      "No": "Non"
+    },
+    "Roles": {
+      "Player": "Joueur",
+      "Trusted": "Joueur de confiance",
+      "Assistant": "Assistant MJ",
+      "Gamemaster": "MJ",
+      "Unknown": "Inconnu"
+    },
     "Settings": {
       "NoUser": "Aucun utilisateur",
+      "NoRelevantUsers": "Aucun utilisateur joueur n'est disponible pour Remote Action.",
+      "UserConfiguration": {
+        "Name": "Configuration des utilisateurs",
+        "Hint": "Ouvre la fenetre dediee pour choisir le recepteur principal et les emetteurs autorises.",
+        "Label": "Configurer",
+        "Title": "Remote Action - Utilisateurs",
+        "Description": "Choisissez un recepteur principal unique et cochez les emetteurs autorises."
+      },
+      "Columns": {
+        "Name": "Nom",
+        "Role": "Role",
+        "Connected": "Connecte",
+        "PrimaryReceiver": "Recepteur principal",
+        "AuthorizedSender": "Emetteur autorise"
+      },
       "PrimaryReceiver": {
         "Name": "Recepteur principal",
-        "Hint": "Utilisateur qui recevra les actions distantes."
+        "Hint": "Utilisateur interne configure via la fenetre dediee Remote Action."
       },
       "AuthorizedSenders": {
         "Name": "Emetteurs autorises",
-        "Hint": "Liste des IDs utilisateurs autorises a emettre des actions, separes par des virgules pour ce MVP."
+        "Hint": "Utilisateurs internes configures via la fenetre dediee Remote Action."
       },
       "Debug": {
         "Name": "Mode debug",

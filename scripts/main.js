@@ -1,7 +1,7 @@
 import { MODULE_ID, registerSettings } from "./settings.js";
 import { registerSocket } from "./socket.js";
 import { registerUiHooks } from "./ui-hooks.js";
-import { pingRelay, relayAction } from "./relay.js";
+import { debugConfig, pingRelay, relayAction } from "./relay.js";
 import { logDebug, logInfo, logWarning } from "./debug.js";
 
 Hooks.once("init", () => {
@@ -17,6 +17,7 @@ Hooks.once("init", () => {
   const module = game.modules.get(MODULE_ID);
   if (module) {
     module.api = {
+      debugConfig,
       pingRelay,
       relayAction
     };
@@ -30,6 +31,7 @@ Hooks.once("setup", () => {
 
 Hooks.once("ready", () => {
   game.remoteAction = {
+    debugConfig,
     pingRelay,
     relayAction
   };

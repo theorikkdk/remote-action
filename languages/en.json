@@ -1,14 +1,40 @@
 {
   "REMOTE_ACTION": {
+    "Common": {
+      "Yes": "Yes",
+      "No": "No"
+    },
+    "Roles": {
+      "Player": "Player",
+      "Trusted": "Trusted Player",
+      "Assistant": "Assistant GM",
+      "Gamemaster": "Gamemaster",
+      "Unknown": "Unknown"
+    },
     "Settings": {
       "NoUser": "No user",
+      "NoRelevantUsers": "No player user is available for Remote Action.",
+      "UserConfiguration": {
+        "Name": "User configuration",
+        "Hint": "Open the dedicated window to choose the primary receiver and authorized senders.",
+        "Label": "Configure",
+        "Title": "Remote Action - Users",
+        "Description": "Choose a single primary receiver and check the authorized senders."
+      },
+      "Columns": {
+        "Name": "Name",
+        "Role": "Role",
+        "Connected": "Connected",
+        "PrimaryReceiver": "Primary receiver",
+        "AuthorizedSender": "Authorized sender"
+      },
       "PrimaryReceiver": {
         "Name": "Primary receiver",
-        "Hint": "User who will receive remote actions."
+        "Hint": "Internal user configured through the dedicated Remote Action window."
       },
       "AuthorizedSenders": {
         "Name": "Authorized senders",
-        "Hint": "Comma-separated list of user IDs allowed to emit actions in this MVP."
+        "Hint": "Internal users configured through the dedicated Remote Action window."
       },
       "Debug": {
         "Name": "Debug mode",

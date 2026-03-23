@@ -1,0 +1,57 @@
+<form class="remote-action-user-config">
+  <p class="notes">{{localize "REMOTE_ACTION.Settings.UserConfiguration.Description"}}</p>
+
+  {{#if hasUsers}}
+  <table class="remote-action-user-config-table">
+    <thead>
+      <tr>
+        <th>{{localize "REMOTE_ACTION.Settings.Columns.Name"}}</th>
+        <th>{{localize "REMOTE_ACTION.Settings.Columns.Role"}}</th>
+        <th>{{localize "REMOTE_ACTION.Settings.Columns.Connected"}}</th>
+        <th>{{localize "REMOTE_ACTION.Settings.Columns.PrimaryReceiver"}}</th>
+        <th>{{localize "REMOTE_ACTION.Settings.Columns.AuthorizedSender"}}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#each users}}
+      <tr>
+        <td>{{this.name}}</td>
+        <td>{{this.role}}</td>
+        <td>{{#if this.isActive}}{{localize "REMOTE_ACTION.Common.Yes"}}{{else}}{{localize "REMOTE_ACTION.Common.No"}}{{/if}}</td>
+        <td>
+          <input
+            type="radio"
+            name="primaryReceiverUserId"
+            value="{{this.id}}"
+            {{#if this.isPrimaryReceiver}}checked{{/if}}
+          >
+        </td>
+        <td>
+          <input
+            type="checkbox"
+            name="authorizedSenderUserIds.{{this.id}}"
+            {{#if this.isAuthorizedSender}}checked{{/if}}
+          >
+        </td>
+      </tr>
+      {{/each}}
+      <tr>
+        <td colspan="3">{{localize "REMOTE_ACTION.Settings.NoUser"}}</td>
+        <td>
+          <input type="radio" name="primaryReceiverUserId" value="" {{#unless hasPrimaryReceiver}}checked{{/unless}}>
+        </td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  {{else}}
+  <p class="notes">{{noUsersMessage}}</p>
+  {{/if}}
+
+  <footer class="sheet-footer flexrow">
+    <button type="submit">
+      <i class="fas fa-save"></i>
+      {{localize "SETTINGS.Save"}}
+    </button>
+  </footer>
+</form>
