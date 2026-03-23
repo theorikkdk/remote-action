@@ -7,6 +7,75 @@ import {
 import { getRemoteActionSocket, SOCKET_HANDLERS } from "./socket.js";
 import { logDebug, logWarning } from "./debug.js";
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function buildInvalidPayloadResponse(errors, payload) {
+  return {
+    ok: false,
+    reason: "invalid-payload",
+    errors,
+    payload
+  };
+}
+
+export function validateActionPayload(payload) {
+  const errors = [];
+
+  if (!isPlainObject(payload)) {
+    errors.push("Payload must be an object.");
+    return {
+      ok: false,
+      errors,
+      normalizedPayload: null
+    };
+  }
+
+  if (typeof payload.actionType !== "string" || !payload.actionType.trim()) {
+    errors.push("actionType is required and must be a non-empty string.");
+  }
+
+  const stringFields = ["actorUuid", "itemUuid", "tokenUuid"];
+  for (const field of stringFields) {
+    if (payload[field] !== undefined && typeof payload[field] !== "string") {
+      errors.push(`${field} must be a string when provided.`);
+    }
+  }
+
+  if (payload.context !== undefined && !isPlainObject(payload.context)) {
+    errors.push("context must be an object when provided.");
+  }
+
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      errors,
+      normalizedPayload: null
+    };
+  }
+
+  const normalizedPayload = {
+    actionType: payload.actionType.trim()
+  };
+
+  for (const field of stringFields) {
+    if (payload[field]) {
+      normalizedPayload[field] = payload[field];
+    }
+  }
+
+  if (payload.context) {
+    normalizedPayload.context = payload.context;
+  }
+
+  return {
+    ok: true,
+    errors: [],
+    normalizedPayload
+  };
+}
+
 export function debugConfig() {
   const snapshot = getRemoteActionConfigSnapshot();
   const socketAvailable = Boolean(getRemoteActionSocket());
@@ -89,6 +158,22 @@ export async function relayAction(actionType, payload = {}) {
 
   logDebug("Relay response received.", response);
   return response;
+}
+
+export async function sendAction(payload) {
+  const validation = validateActionPayload(payload);
+
+  if (!validation.ok) {
+    logWarning("Remote action payload validation failed.", {
+      errors: validation.errors,
+      payload
+    });
+    return buildInvalidPayloadResponse(validation.errors, payload);
+  }
+
+  const normalizedPayload = validation.normalizedPayload;
+  logDebug("Sending generic remote action.", normalizedPayload);
+  return relayAction(normalizedPayload.actionType, normalizedPayload);
 }
 
 export async function pingRelay() {
