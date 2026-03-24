@@ -31,6 +31,19 @@ function buildInvalidActionResponse(request, errors) {
   };
 }
 
+function buildDocumentErrorResponse(request, reason, errors) {
+  return {
+    ok: false,
+    handled: false,
+    reason,
+    errors,
+    actionType: getRequestActionType(request),
+    receiverUserId: game.user?.id ?? null,
+    receiverUserName: game.user?.name ?? null,
+    request
+  };
+}
+
 function handlePingAction(request) {
   return buildBaseResponse(request, {
     handled: true,
@@ -77,6 +90,82 @@ function validateNotifyRequest(request) {
   };
 }
 
+function validateDocumentUuidRequest(request, fieldName, actionType) {
+  const uuid = request?.payload?.[fieldName];
+  const errors = [];
+
+  if (typeof uuid !== "string" || !uuid.trim()) {
+    errors.push(`${fieldName} is required and must be a non-empty string for actionType '${actionType}'.`);
+  }
+
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      errors,
+      normalizedUuid: null
+    };
+  }
+
+  return {
+    ok: true,
+    errors: [],
+    normalizedUuid: uuid.trim()
+  };
+}
+
+function getSheetState(sheet) {
+  return {
+    hasSheet: Boolean(sheet),
+    appId: sheet?.appId ?? null,
+    rendered: Boolean(sheet?.rendered),
+    minimized: Boolean(sheet?._minimized ?? sheet?.minimized),
+    sheetClass: sheet?.constructor?.name ?? null,
+    supportsBringToFront: typeof sheet?.bringToFront === "function",
+    supportsBringToTop: typeof sheet?.bringToTop === "function",
+    supportsMaximize: typeof sheet?.maximize === "function"
+  };
+}
+
+async function makeSheetVisible(sheet) {
+  const actions = [];
+  const before = getSheetState(sheet);
+
+  if (!sheet) {
+    return {
+      actions,
+      before,
+      after: before
+    };
+  }
+
+  logDebug("Preparing sheet visibility update.", before);
+
+  await sheet.render(true);
+  actions.push("render");
+
+  let currentState = getSheetState(sheet);
+
+  if (currentState.minimized && currentState.supportsMaximize) {
+    await sheet.maximize();
+    actions.push("maximize");
+    currentState = getSheetState(sheet);
+  }
+
+  if (currentState.supportsBringToFront) {
+    sheet.bringToFront();
+    actions.push("bringToFront");
+  } else if (currentState.supportsBringToTop) {
+    sheet.bringToTop();
+    actions.push("bringToTop");
+  }
+
+  return {
+    actions,
+    before,
+    after: getSheetState(sheet)
+  };
+}
+
 function handleNotifyAction(request) {
   logDebug("Entering notify handler.", {
     actionType: getRequestActionType(request),
@@ -113,6 +202,141 @@ function handleNotifyAction(request) {
   });
 }
 
+async function handleOpenDocumentSheetAction(request, options) {
+  const {
+    actionType,
+    uuidField,
+    expectedClass,
+    expectedTypeLabel,
+    responseKey,
+    successMessage
+  } = options;
+
+  logDebug(`Entering ${actionType} handler.`, {
+    actionType,
+    uuidField,
+    documentUuid: request?.payload?.[uuidField],
+    request
+  });
+
+  const validation = validateDocumentUuidRequest(request, uuidField, actionType);
+  if (!validation.ok) {
+    logDebug(`${actionType} payload validation failed.`, {
+      actionType,
+      errors: validation.errors,
+      request
+    });
+    return buildInvalidActionResponse(request, validation.errors);
+  }
+
+  const documentUuid = validation.normalizedUuid;
+  const document = await fromUuid(documentUuid);
+
+  logDebug("Resolved document sheet target.", {
+    actionType,
+    documentUuid,
+    documentFound: Boolean(document),
+    documentName: document?.name ?? null,
+    documentType: document?.documentName ?? null
+  });
+
+  if (!document) {
+    return buildDocumentErrorResponse(request, "document-not-found", [
+      `No document found for ${uuidField} '${documentUuid}'.`
+    ]);
+  }
+
+  if (!(document instanceof expectedClass)) {
+    return buildDocumentErrorResponse(request, "invalid-document-type", [
+      `UUID '${documentUuid}' does not resolve to an ${expectedTypeLabel}.`
+    ]);
+  }
+
+  const sheet = document.sheet ?? null;
+  const initialSheetState = getSheetState(sheet);
+
+  logDebug("Document sheet instance resolved.", {
+    actionType,
+    documentUuid,
+    documentName: document.name,
+    expectedTypeLabel,
+    hasSheet: initialSheetState.hasSheet,
+    sheetClass: initialSheetState.sheetClass,
+    sheetAppId: initialSheetState.appId,
+    sheetRendered: initialSheetState.rendered,
+    sheetMinimized: initialSheetState.minimized,
+    supportsBringToFront: initialSheetState.supportsBringToFront,
+    supportsBringToTop: initialSheetState.supportsBringToTop,
+    supportsMaximize: initialSheetState.supportsMaximize
+  });
+
+  if (!sheet) {
+    return buildDocumentErrorResponse(request, "sheet-unavailable", [
+      `No sheet instance is available for ${uuidField} '${documentUuid}'.`
+    ]);
+  }
+
+  const visibilityResult = await makeSheetVisible(sheet);
+
+  logDebug("Document sheet visibility actions applied.", {
+    actionType,
+    documentUuid,
+    documentName: document.name,
+    expectedTypeLabel,
+    sheetClass: visibilityResult.after.sheetClass,
+    sheetAppId: visibilityResult.after.appId,
+    renderedBefore: visibilityResult.before.rendered,
+    minimizedBefore: visibilityResult.before.minimized,
+    renderedAfter: visibilityResult.after.rendered,
+    minimizedAfter: visibilityResult.after.minimized,
+    supportsBringToFront: visibilityResult.after.supportsBringToFront,
+    supportsBringToTop: visibilityResult.after.supportsBringToTop,
+    supportsMaximize: visibilityResult.after.supportsMaximize,
+    actions: visibilityResult.actions
+  });
+
+  return buildBaseResponse(request, {
+    handled: true,
+    message: successMessage,
+    [responseKey]: {
+      uuid: documentUuid,
+      id: document.id,
+      name: document.name
+    },
+    [`${responseKey}Name`]: document.name,
+    sheetClass: visibilityResult.after.sheetClass,
+    sheetAppId: visibilityResult.after.appId,
+    sheetRendered: visibilityResult.after.rendered,
+    sheetMinimized: visibilityResult.after.minimized,
+    supportsBringToFront: visibilityResult.after.supportsBringToFront,
+    supportsBringToTop: visibilityResult.after.supportsBringToTop,
+    supportsMaximize: visibilityResult.after.supportsMaximize,
+    actions: visibilityResult.actions
+  });
+}
+
+async function handleOpenActorSheetAction(request) {
+  return handleOpenDocumentSheetAction(request, {
+    actionType: "open-actor-sheet",
+    uuidField: "actorUuid",
+    expectedClass: Actor,
+    expectedTypeLabel: "Actor",
+    responseKey: "actor",
+    successMessage: "Remote Action opened actor sheet on receiver."
+  });
+}
+
+async function handleOpenItemSheetAction(request) {
+  return handleOpenDocumentSheetAction(request, {
+    actionType: "open-item-sheet",
+    uuidField: "itemUuid",
+    expectedClass: Item,
+    expectedTypeLabel: "Item",
+    responseKey: "item",
+    successMessage: "Remote Action opened item sheet on receiver."
+  });
+}
+
 function handleUnknownAction(request) {
   const actionType = getRequestActionType(request);
 
@@ -142,6 +366,10 @@ export async function executeRemoteAction(request = {}) {
       return handlePingAction(request);
     case "notify":
       return handleNotifyAction(request);
+    case "open-actor-sheet":
+      return handleOpenActorSheetAction(request);
+    case "open-item-sheet":
+      return handleOpenItemSheetAction(request);
     default:
       return handleUnknownAction(request);
   }

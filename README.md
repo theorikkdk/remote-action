@@ -104,6 +104,14 @@ Setting client permettant d'activer des logs supplementaires.
 
 Note : le dossier du module doit s'appeler exactement `remote-action` et le manifest attendu doit se trouver a `D:\FoundryVTT\Data\modules\remote-action\module.json`.
 
+## Compatibilite
+
+L'action `open-actor-sheet` fonctionne dans le MVP.
+
+Attention : certains modules d'affichage, comme Monk's Common Display, peuvent empecher l'ouverture visible des fiches si leur masquage d'interface est actif.
+
+Dans nos tests, l'usage de Lock View pour masquer l'UI, avec Monk's Common Display actif mais sans masquage d'interface par Monk's, fonctionne correctement.
+
 ## Suite recommandee
 
 Les prochaines etapes naturelles seront :
