@@ -6,15 +6,18 @@ export const MODULE_ID = "remote-action";
 export const SETTING_KEYS = {
   PRIMARY_RECEIVER: "primaryReceiverUserId",
   AUTHORIZED_SENDERS: "authorizedSenderUserIds",
-  DEBUG: "debug"
+  DEBUG: "debug",
+  EMITTER_NOTIFICATIONS: "emitterNotifications",
+  AUTO_INTERCEPT_ITEM_USE: "autoInterceptItemUse",
+  USE_ATTACK_ROLLS: "useFoundryAttackRolls",
+  USE_DAMAGE_ROLLS: "useFoundryDamageRolls",
+  USE_SAVE_ROLLS: "useFoundrySaveRolls"
 };
 
 export function getRelevantRemoteActionUsers() {
   const currentUserId = game.user?.id;
   const users = Array.from(game.users ?? []).filter((user) => !user.isGM);
 
-  // Keep the MVP player-focused, but always include the current user so the
-  // console ping test can be configured and diagnosed from the active session.
   const currentUser = game.users?.get(currentUserId);
   if (currentUser && !users.some((user) => user.id === currentUser.id)) {
     users.push(currentUser);
@@ -92,6 +95,56 @@ export function registerSettings() {
     default: false,
     requiresReload: false
   });
+
+  game.settings.register(MODULE_ID, SETTING_KEYS.EMITTER_NOTIFICATIONS, {
+    name: "REMOTE_ACTION.Settings.EmitterNotifications.Name",
+    hint: "REMOTE_ACTION.Settings.EmitterNotifications.Hint",
+    scope: "client",
+    config: true,
+    type: Boolean,
+    default: true,
+    requiresReload: false
+  });
+
+  game.settings.register(MODULE_ID, SETTING_KEYS.AUTO_INTERCEPT_ITEM_USE, {
+    name: "REMOTE_ACTION.Settings.AutoInterceptItemUse.Name",
+    hint: "REMOTE_ACTION.Settings.AutoInterceptItemUse.Hint",
+    scope: "client",
+    config: true,
+    type: Boolean,
+    default: true,
+    requiresReload: false
+  });
+
+  game.settings.register(MODULE_ID, SETTING_KEYS.USE_ATTACK_ROLLS, {
+    name: "REMOTE_ACTION.Settings.UseAttackRolls.Name",
+    hint: "REMOTE_ACTION.Settings.UseAttackRolls.Hint",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true,
+    requiresReload: false
+  });
+
+  game.settings.register(MODULE_ID, SETTING_KEYS.USE_DAMAGE_ROLLS, {
+    name: "REMOTE_ACTION.Settings.UseDamageRolls.Name",
+    hint: "REMOTE_ACTION.Settings.UseDamageRolls.Hint",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true,
+    requiresReload: false
+  });
+
+  game.settings.register(MODULE_ID, SETTING_KEYS.USE_SAVE_ROLLS, {
+    name: "REMOTE_ACTION.Settings.UseSaveRolls.Name",
+    hint: "REMOTE_ACTION.Settings.UseSaveRolls.Hint",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true,
+    requiresReload: false
+  });
 }
 
 export function getPrimaryReceiverUserId() {
@@ -101,6 +154,22 @@ export function getPrimaryReceiverUserId() {
 export function getAuthorizedSenderUserIds() {
   const rawValue = game.settings.get(MODULE_ID, SETTING_KEYS.AUTHORIZED_SENDERS);
   return parseAuthorizedSenderIds(rawValue);
+}
+
+export function isEmitterNotificationsEnabled() {
+  return Boolean(game.settings.get(MODULE_ID, SETTING_KEYS.EMITTER_NOTIFICATIONS));
+}
+
+export function isAutoInterceptItemUseEnabled() {
+  return Boolean(game.settings.get(MODULE_ID, SETTING_KEYS.AUTO_INTERCEPT_ITEM_USE));
+}
+
+export function getWorkflowSettings() {
+  return {
+    useAttackRolls: Boolean(game.settings.get(MODULE_ID, SETTING_KEYS.USE_ATTACK_ROLLS)),
+    useDamageRolls: Boolean(game.settings.get(MODULE_ID, SETTING_KEYS.USE_DAMAGE_ROLLS)),
+    useSaveRolls: Boolean(game.settings.get(MODULE_ID, SETTING_KEYS.USE_SAVE_ROLLS))
+  };
 }
 
 export function getRemoteActionConfigSnapshot() {
@@ -131,7 +200,10 @@ export function getRemoteActionConfigSnapshot() {
     })),
     isCurrentUserAuthorized: currentUser
       ? authorizedSenderUserIds.includes(currentUser.id)
-      : false
+      : false,
+    emitterNotifications: isEmitterNotificationsEnabled(),
+    autoInterceptItemUse: isAutoInterceptItemUseEnabled(),
+    workflowSettings: getWorkflowSettings()
   };
 }
 

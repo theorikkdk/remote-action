@@ -4,6 +4,12 @@
       "Yes": "Oui",
       "No": "Non"
     },
+    "Notifications": {
+      "ItemUseSent": "Remote Action : demande d'usage envoyee pour {item}.",
+      "ItemUseDialogSent": "Remote Action : popup d'usage envoyee vers l'ecran central pour {item}.",
+      "ItemUseDirectWorkflowSent": "Remote Action : workflow d'usage lance sur l'ecran central pour {item}.",
+      "ItemUseFailed": "Remote Action : echec de l'envoi pour {item} ({reason})."
+    },
     "Roles": {
       "Player": "Joueur",
       "Trusted": "Joueur de confiance",
@@ -39,6 +45,26 @@
       "Debug": {
         "Name": "Mode debug",
         "Hint": "Active des logs supplementaires dans la console."
+      },
+      "EmitterNotifications": {
+        "Name": "Notifications cote emetteur",
+        "Hint": "Affiche un retour local sur le client emetteur quand un open-item-use-dialog est bien relaie ou echoue."
+      },
+      "UseAttackRolls": {
+        "Name": "Utiliser les jets d'attaque Foundry",
+        "Hint": "Reglage preparatoire pour la suite. N'influence pas encore le workflow reel."
+      },
+      "UseDamageRolls": {
+        "Name": "Utiliser les jets de degats Foundry",
+        "Hint": "Reglage preparatoire pour la suite. N'influence pas encore le workflow reel."
+      },
+      "UseSaveRolls": {
+        "Name": "Utiliser les jets de sauvegarde Foundry",
+        "Hint": "Reglage preparatoire pour la suite. N'influence pas encore le workflow reel."
+      },
+      "AutoInterceptItemUse": {
+        "Name": "Intercepter l'usage depuis la fiche acteur",
+        "Hint": "Active par defaut pour les emetteurs autorises. Permet un override local pour desactiver l'interception automatique de l'usage DnD5e depuis la fiche acteur."
       }
     },
     "Errors": {

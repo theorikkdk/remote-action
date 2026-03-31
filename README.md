@@ -104,6 +104,33 @@ Setting client permettant d'activer des logs supplementaires.
 
 Note : le dossier du module doit s'appeler exactement `remote-action` et le manifest attendu doit se trouver a `D:\FoundryVTT\Data\modules\remote-action\module.json`.
 
+## Mode recommande
+
+Le mode principal recommande pour la table est :
+
+- `Utiliser les jets d'attaque Foundry` = desactive
+- `Utiliser les jets de degats Foundry` = active
+
+Dans ce mode :
+
+- le jet d'attaque est fait en physique hors Foundry
+- le token controle sert de source / attaquant
+- les tokens actuellement cibles servent de destinataires
+- pour les armes simples, le module privilegie un chemin de degats oriente `Midi-QOL` afin de produire une vraie carte de degats exploitable cote MJ
+
+Le mode `jets d'attaque Foundry = active` reste disponible, mais doit encore etre considere comme un mode natif / experimental pour les attaques d'armes tant qu'il n'est pas fiabilise.
+
+## Interception prevue
+
+La prochaine interception cote fiche telephone sera branchee sur le clic d'usage DnD5e des elements de fiche acteur, en visant d'abord le selecteur :
+
+- `.item-image.item-action[data-action="use"]`
+
+Le wrapper retrouvera l'item via le conteneur le plus proche portant `data-item-id`, puis relayera :
+
+- `game.remoteAction.sendAction({ actionType: "open-item-use-dialog", itemUuid })`
+
+Cette approche colle aux templates DnD5e actuels des sections features et spellbook, tout en restant suffisamment legere pour un MVP.
 ## Compatibilite
 
 L'action `open-actor-sheet` fonctionne dans le MVP.

@@ -2,10 +2,11 @@ import {
   getPrimaryReceiverUserId,
   getAuthorizedSenderUserIds,
   getRemoteActionConfigSnapshot,
+  isEmitterNotificationsEnabled,
   isSenderAuthorized
 } from "./settings.js";
 import { getRemoteActionSocket, SOCKET_HANDLERS } from "./socket.js";
-import { logDebug, logWarning } from "./debug.js";
+import { logDebug, logWarning, notifyInfo, notifyWarning } from "./debug.js";
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -18,6 +19,41 @@ function buildInvalidPayloadResponse(errors, payload) {
     errors,
     payload
   };
+}
+
+function buildEmitterNotificationMessage(payload, response) {
+  const itemLabel = response?.itemName ?? payload?.itemUuid ?? payload?.actionType ?? "item";
+
+  if (response?.ok && response?.handled) {
+    if (response.launchMode === "dialog") {
+      return game.i18n.format("REMOTE_ACTION.Notifications.ItemUseDialogSent", { item: itemLabel });
+    }
+
+    if (response.launchMode === "direct-workflow") {
+      return game.i18n.format("REMOTE_ACTION.Notifications.ItemUseDirectWorkflowSent", { item: itemLabel });
+    }
+
+    return game.i18n.format("REMOTE_ACTION.Notifications.ItemUseSent", { item: itemLabel });
+  }
+
+  const reason = response?.reason ?? "unknown";
+  return game.i18n.format("REMOTE_ACTION.Notifications.ItemUseFailed", {
+    item: itemLabel,
+    reason
+  });
+}
+
+function maybeNotifyEmitter(actionType, payload, response) {
+  if (!isEmitterNotificationsEnabled()) return;
+  if (actionType !== "open-item-use-dialog") return;
+
+  const message = buildEmitterNotificationMessage(payload, response);
+  if (response?.ok && response?.handled) {
+    notifyInfo(message);
+    return;
+  }
+
+  notifyWarning(message);
 }
 
 export function validateActionPayload(payload) {
@@ -79,13 +115,25 @@ export function validateActionPayload(payload) {
 export function debugConfig() {
   const snapshot = getRemoteActionConfigSnapshot();
   const socketAvailable = Boolean(getRemoteActionSocket());
+  const recommendedTableModeActive = !snapshot.workflowSettings.useAttackRolls && snapshot.workflowSettings.useDamageRolls;
+  const currentWorkflowProfile = recommendedTableModeActive
+    ? "recommended-manual-hit-foundry-damage"
+    : snapshot.workflowSettings.useAttackRolls
+      ? "native-foundry-attack-experimental"
+      : "custom-workflow-profile";
+
   const debugData = {
     currentUser: snapshot.currentUser,
     primaryReceiver: snapshot.primaryReceiver,
     authorizedSenders: snapshot.authorizedSenderUsers,
     authorizedSenderUserIds: snapshot.authorizedSenderUserIds,
     socketAvailable,
-    isCurrentUserAuthorized: snapshot.isCurrentUserAuthorized
+    isCurrentUserAuthorized: snapshot.isCurrentUserAuthorized,
+    emitterNotifications: snapshot.emitterNotifications,
+    workflowSettings: snapshot.workflowSettings,
+    recommendedTableModeActive,
+    currentWorkflowProfile,
+    nativeAttackWorkflowExperimental: snapshot.workflowSettings.useAttackRolls
   };
 
   console.info("remote-action | Debug config", debugData);
@@ -115,7 +163,9 @@ export async function relayAction(actionType, payload = {}) {
 
   if (!primaryReceiverUserId) {
     logWarning("No primary receiver configured.");
-    return { ok: false, reason: "missing-receiver" };
+    const response = { ok: false, reason: "missing-receiver" };
+    maybeNotifyEmitter(actionType, payload, response);
+    return response;
   }
 
   if (!canRelayFromCurrentUser()) {
@@ -125,7 +175,9 @@ export async function relayAction(actionType, payload = {}) {
       primaryReceiverUserId,
       authorizedSenderUserIds
     });
-    return { ok: false, reason: "unauthorized-sender" };
+    const response = { ok: false, reason: "unauthorized-sender" };
+    maybeNotifyEmitter(actionType, payload, response);
+    return response;
   }
 
   const socket = getRemoteActionSocket();
@@ -136,7 +188,9 @@ export async function relayAction(actionType, payload = {}) {
       primaryReceiverUserId,
       authorizedSenderUserIds
     });
-    return { ok: false, reason: "missing-socket" };
+    const response = { ok: false, reason: "missing-socket" };
+    maybeNotifyEmitter(actionType, payload, response);
+    return response;
   }
 
   const request = {
@@ -157,6 +211,7 @@ export async function relayAction(actionType, payload = {}) {
   );
 
   logDebug("Relay response received.", response);
+  maybeNotifyEmitter(actionType, payload, response);
   return response;
 }
 
@@ -168,7 +223,9 @@ export async function sendAction(payload) {
       errors: validation.errors,
       payload
     });
-    return buildInvalidPayloadResponse(validation.errors, payload);
+    const response = buildInvalidPayloadResponse(validation.errors, payload);
+    maybeNotifyEmitter(payload?.actionType, payload, response);
+    return response;
   }
 
   const normalizedPayload = validation.normalizedPayload;
