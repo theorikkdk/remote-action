@@ -256,6 +256,23 @@ function getWorkflowParticipants(item) {
   };
 }
 
+function normalizeWorkflowParticipants(participants = {}) {
+  return {
+    sourceActor: participants?.sourceActor ?? null,
+    sourceToken: participants?.sourceToken ?? null,
+    sourceResolution: participants?.sourceResolution ?? null,
+    controlledTokens: Array.isArray(participants?.controlledTokens)
+      ? participants.controlledTokens.filter(Boolean)
+      : [],
+    targets: Array.isArray(participants?.targets)
+      ? participants.targets.filter(Boolean)
+      : []
+  };
+}
+
+function isThenable(value) {
+  return typeof value?.then === "function";
+}
 function getMidiQolApi() {
   if (!game.modules?.get("midi-qol")?.active) return null;
   if (globalThis.MidiQOL?.DamageOnlyWorkflow) return globalThis.MidiQOL;
@@ -1604,6 +1621,88 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     workflowSettings = getWorkflowSettings(),
     midiApi = getMidiQolApi()
   } = options;
+  const normalizedParticipants = normalizeWorkflowParticipants(participants);
+  participants = normalizedParticipants;
+  const baseActivitySummary = getActivitySummary(activity, {});
+
+  if (typeof activity?._prepareUsageConfig !== "function") {
+    logWarning("Remote spell workflow prerequisites missing before item.use.", {
+      itemUuid: item?.uuid ?? null,
+      itemName: item?.name ?? null,
+      activityUuid: activity?.uuid ?? null,
+      activityName: baseActivitySummary.activityName,
+      activityType: baseActivitySummary.activityType,
+      attemptedMethod: "item.use",
+      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+      missingPrerequisite: "activity._prepareUsageConfig",
+      midiAvailable: Boolean(midiApi),
+      sourceActor: serializeActor(normalizedParticipants.sourceActor),
+      sourceToken: serializeToken(normalizedParticipants.sourceToken),
+      sourceResolution: normalizedParticipants.sourceResolution,
+      targets: normalizedParticipants.targets.map(serializeToken)
+    });
+
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+      attemptedMethod: "item.use",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: Boolean(midiApi),
+      sourceActor: serializeActor(normalizedParticipants.sourceActor),
+      sourceToken: serializeToken(normalizedParticipants.sourceToken),
+      sourceResolution: normalizedParticipants.sourceResolution,
+      targets: normalizedParticipants.targets.map(serializeToken),
+      ...baseActivitySummary,
+      errors: ["The dnd5e activity._prepareUsageConfig API is not available for this item."]
+    };
+  }
+
+  if (typeof item?.use !== "function") {
+    logWarning("Remote spell workflow prerequisites missing before item.use.", {
+      itemUuid: item?.uuid ?? null,
+      itemName: item?.name ?? null,
+      activityUuid: activity?.uuid ?? null,
+      activityName: baseActivitySummary.activityName,
+      activityType: baseActivitySummary.activityType,
+      attemptedMethod: "item.use",
+      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+      missingPrerequisite: "item.use",
+      midiAvailable: Boolean(midiApi),
+      sourceActor: serializeActor(normalizedParticipants.sourceActor),
+      sourceToken: serializeToken(normalizedParticipants.sourceToken),
+      sourceResolution: normalizedParticipants.sourceResolution,
+      targets: normalizedParticipants.targets.map(serializeToken)
+    });
+
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+      attemptedMethod: "item.use",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: Boolean(midiApi),
+      sourceActor: serializeActor(normalizedParticipants.sourceActor),
+      sourceToken: serializeToken(normalizedParticipants.sourceToken),
+      sourceResolution: normalizedParticipants.sourceResolution,
+      targets: normalizedParticipants.targets.map(serializeToken),
+      ...baseActivitySummary,
+      errors: ["The dnd5e item.use API is not available for this item."]
+    };
+  }
+
 
   const usageConfig = activity._prepareUsageConfig({});
   const activitySummary = getActivitySummary(activity, usageConfig);
@@ -1679,6 +1778,10 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     });
 
     workflowPromise = item.use(remoteSpellUsage, { configure: true }, { create: true });
+
+    if (!isThenable(workflowPromise)) {
+      throw new Error("item.use did not return a promise.");
+    }
 
     logDebug("Remote spell workflow item.use returned promise.", {
       itemUuid: item.uuid,
@@ -2040,12 +2143,38 @@ async function startDnd5eDamageOnlyWorkflow(item, activity, participants, option
     isCritical = false,
     midiApi = getMidiQolApi()
   } = options;
+  participants = normalizeWorkflowParticipants(participants);
 
   const activitySummary = getActivitySummary(activity, {});
+  const midiAvailable = Boolean(midiApi?.DamageOnlyWorkflow);
+  if (typeof activity?.rollDamage !== "function") {
+    return {
+      ok: false,
+      reason: "damage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode,
+      attemptedMethod: midiAvailable ? "MidiQOL.DamageOnlyWorkflow" : "activity.rollDamage",
+      isCritical,
+      damageRolled: false,
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable,
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      ...activitySummary,
+      errors: ["The dnd5e activity.rollDamage API is not available for this item."]
+    };
+  }
+
   const sourceActor = participants.sourceActor;
   const sourceToken = participants.sourceToken;
   const targets = participants.targets;
-  const midiAvailable = Boolean(midiApi?.DamageOnlyWorkflow);
 
   if (targets.length === 0) {
     return {
@@ -2117,6 +2246,31 @@ async function startDnd5eDamageOnlyWorkflow(item, activity, participants, option
       { configure: true },
       { create: true }
     );
+
+    if (!isThenable(damagePromise)) {
+      return {
+        ok: false,
+        reason: "damage-workflow-unavailable",
+        launchMode: "unavailable",
+        workflowMode,
+        attemptedMethod: "activity.rollDamage",
+        isCritical,
+        damageRolled: false,
+        dialogApp: null,
+        dialogVisible: false,
+        chatMessageId: null,
+        chatCardCreated: false,
+        chatFocusActions: [],
+        midiAvailable: false,
+        midiUsed: false,
+        sourceActor: serializeActor(sourceActor),
+        sourceToken: serializeToken(sourceToken),
+        sourceResolution: participants.sourceResolution,
+        targets: targets.map(serializeToken),
+        ...activitySummary,
+        errors: ["The dnd5e activity.rollDamage API did not return a promise for this item."]
+      };
+    }
 
     damagePromise.then((result) => {
       const resultSummary = summarizeWorkflowResult(result);
@@ -2351,10 +2505,70 @@ async function startDnd5eDamageOnlyWorkflow(item, activity, participants, option
 }
 
 async function startDnd5eItemUsageWorkflow(item) {
-  const activities = item.system.activities?.filter((activity) => activity.canUse) ?? [];
+  if (!item) {
+    return {
+      ok: false,
+      reason: "document-not-found",
+      launchMode: "unavailable",
+      workflowMode: "native-foundry",
+      attemptedMethod: null,
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: false,
+      midiUsed: false,
+      sourceActor: null,
+      sourceToken: null,
+      sourceResolution: null,
+      targets: [],
+      activityId: null,
+      activityName: null,
+      activityType: null,
+      requiresDialog: null,
+      errors: ["No Item document was provided for the remote usage workflow."]
+    };
+  }
+
+  if (item.system?.activities && typeof item.system.activities.filter !== "function") {
+    logWarning("Remote item usage prerequisites missing before activity resolution.", {
+      itemUuid: item.uuid,
+      itemName: item.name,
+      missingPrerequisite: "item.system.activities.filter"
+    });
+
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: "native-foundry",
+      attemptedMethod: null,
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: false,
+      midiUsed: false,
+      sourceActor: null,
+      sourceToken: null,
+      sourceResolution: null,
+      targets: [],
+      activityId: null,
+      activityName: null,
+      activityType: null,
+      requiresDialog: null,
+      errors: ["The dnd5e activity collection is not available for this item."]
+    };
+  }
+
+  const activities = typeof item.system?.activities?.filter === "function"
+    ? item.system.activities.filter((activity) => activity.canUse)
+    : [];
   const activity = activities[0] ?? null;
   const workflowSettings = getWorkflowSettings();
-  const participants = getWorkflowParticipants(item);
+  const participants = normalizeWorkflowParticipants(getWorkflowParticipants(item));
   const midiApi = getMidiQolApi();
   const midiAvailable = Boolean(midiApi?.DamageOnlyWorkflow);
 
@@ -2466,6 +2680,33 @@ async function startDnd5eItemUsageWorkflow(item) {
     });
   }
 
+
+  if (typeof activity._prepareUsageConfig !== "function") {
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: "native-foundry",
+      attemptedMethod: "activity.use",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable,
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      activityId: activity.id ?? null,
+      activityName: activity.name ?? null,
+      activityType: activity.type ?? activity.metadata?.type ?? null,
+      requiresDialog: null,
+      errors: ["The dnd5e activity._prepareUsageConfig API is not available for this item."]
+    };
+  }
+
   const usageConfig = activity._prepareUsageConfig({});
   const activitySummary = getActivitySummary(activity, usageConfig);
   const launchMode = activitySummary.requiresDialog ? "dialog" : "direct-workflow";
@@ -2536,6 +2777,29 @@ async function startDnd5eItemUsageWorkflow(item) {
   const beforeIds = new Set(Object.keys(ui?.windows ?? {}));
   const beforeMessageIds = new Set(Array.from(game.messages ?? []).map((message) => String(message.id)));
   const workflowPromise = activity.use({}, { configure: true }, { create: true });
+
+  if (!isThenable(workflowPromise)) {
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: "native-foundry",
+      attemptedMethod: "activity.use",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable,
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      ...activitySummary,
+      errors: ["The dnd5e activity.use API did not return a promise for this item."]
+    };
+  }
 
   workflowPromise.then((result) => {
     const resultSummary = summarizeWorkflowResult(result);
