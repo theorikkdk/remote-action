@@ -4,6 +4,7 @@ import { getWorkflowSettings } from "./settings.js";
 const NOTIFICATION_LEVELS = new Set(["info", "warn", "error"]);
 const MANUAL_HIT_WORKFLOW_MODE = "manual-hit-foundry-damage";
 const MIDI_SPELL_WORKFLOW_MODE = "midi-spell-complete-activity-use";
+const REMOTE_SPELL_AUTO_ROLL_DAMAGE_MODE = "saveOnly";
 const LOCAL_GM_SPELL_WORKFLOW_MODE = "local-gm-native-spell-use";
 const REMOTE_TV_SPELL_WORKFLOW_SOURCE = "remote-tv";
 const LOCAL_GM_SPELL_WORKFLOW_SOURCE = "local-gm";
@@ -336,6 +337,39 @@ function getSpellWorkflowBranchProbe(item, activity, midiApi) {
 
 function shouldUseMidiSpellWorkflow(item, activity, midiApi) {
   return getSpellWorkflowBranchProbe(item, activity, midiApi).shouldUseMidiSpellWorkflow;
+}
+
+function shouldForceRemoteSpellDamageRoll(activity, activitySummary, workflowSettings) {
+  return Boolean(workflowSettings?.useDamageRolls)
+    && activitySummary?.activityType === "save"
+    && Boolean(activity?.target?.template?.type)
+    && Boolean(activity?.hasDamage);
+}
+
+function buildRemoteSpellUsage(activity, activitySummary, workflowSettings) {
+  const usage = { legacy: false };
+  const shouldForceDamageRoll = shouldForceRemoteSpellDamageRoll(
+    activity,
+    activitySummary,
+    workflowSettings
+  );
+
+  if (shouldForceDamageRoll) {
+    foundry.utils.setProperty(
+      usage,
+      "midiOptions.workflowOptions.autoRollDamage",
+      REMOTE_SPELL_AUTO_ROLL_DAMAGE_MODE
+    );
+    foundry.utils.setProperty(usage, "midiOptions.workflowOptions.fastForwardDamage", true);
+    foundry.utils.setProperty(usage, "midiOptions.fastForwardDamage", true);
+  }
+
+  return {
+    usage,
+    shouldForceRemoteSpellDamageRoll: shouldForceDamageRoll,
+    remoteSpellWorkflowOptions:
+      foundry.utils.getProperty(usage, "midiOptions.workflowOptions") ?? {}
+  };
 }
 
 function getSpellWorkflowMonitorLabel(monitorSource) {
@@ -1583,17 +1617,11 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     workflowMode: MIDI_SPELL_WORKFLOW_MODE,
     monitorSource: REMOTE_TV_SPELL_WORKFLOW_SOURCE
   });
-  const remoteSpellUsage = { legacy: false };
-  const shouldForceRemoteSpellDamageRoll = workflowSettings.useDamageRolls
-    && activitySummary.activityType === "save"
-    && Boolean(activity?.target?.template?.type)
-    && Boolean(activity?.hasDamage);
-
-  if (shouldForceRemoteSpellDamageRoll) {
-    foundry.utils.setProperty(remoteSpellUsage, "midiOptions.workflowOptions.autoRollDamage", "saveOnly");
-    foundry.utils.setProperty(remoteSpellUsage, "midiOptions.workflowOptions.fastForwardDamage", true);
-    foundry.utils.setProperty(remoteSpellUsage, "midiOptions.fastForwardDamage", true);
-  }
+  const {
+    usage: remoteSpellUsage,
+    shouldForceRemoteSpellDamageRoll,
+    remoteSpellWorkflowOptions
+  } = buildRemoteSpellUsage(activity, activitySummary, workflowSettings);
 
 
   logDebug("Preparing remote spell item.use workflow.", {
@@ -1614,7 +1642,7 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     usageConfig,
     nativeSpellWorkflow: true,
     shouldForceRemoteSpellDamageRoll,
-    remoteSpellWorkflowOptions: remoteSpellUsage.midiOptions?.workflowOptions ?? {}
+    remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
   });
 
   logDebug("Remote spell workflow replacement trigger selected.", {
@@ -1632,7 +1660,7 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     sourceToken: serializeToken(participants.sourceToken),
     targets: participants.targets.map(serializeToken),
     shouldForceRemoteSpellDamageRoll,
-    remoteSpellWorkflowOptions: remoteSpellUsage.midiOptions?.workflowOptions ?? {}
+    remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
   });
   let workflowPromise;
   try {
@@ -1647,7 +1675,7 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
       attemptedMethod: "item.use",
       workflowMode: MIDI_SPELL_WORKFLOW_MODE,
       shouldForceRemoteSpellDamageRoll,
-      remoteSpellWorkflowOptions: remoteSpellUsage.midiOptions?.workflowOptions ?? {}
+      remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
     });
 
     workflowPromise = item.use(remoteSpellUsage, { configure: true }, { create: true });
@@ -1662,7 +1690,7 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
       workflowMode: MIDI_SPELL_WORKFLOW_MODE,
       hasThen: typeof workflowPromise?.then === "function",
       shouldForceRemoteSpellDamageRoll,
-      remoteSpellWorkflowOptions: remoteSpellUsage.midiOptions?.workflowOptions ?? {}
+      remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
     });
   } catch (error) {
     clearRemoteSpellActivity(activity?.uuid);
