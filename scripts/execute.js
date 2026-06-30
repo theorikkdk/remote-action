@@ -1,16 +1,20 @@
 import { logDebug, logInfo, logWarning } from "./debug.js";
-import { getWorkflowSettings } from "./settings.js";
+import { MODULE_ID, getWorkflowSettings } from "./settings.js";
 
 const NOTIFICATION_LEVELS = new Set(["info", "warn", "error"]);
-const MANUAL_HIT_WORKFLOW_MODE = "manual-hit-foundry-damage";
+const MANUAL_HIT_WORKFLOW_MODE = "midi-auto-hit-complete-activity-use";
 const MIDI_SPELL_WORKFLOW_MODE = "midi-spell-complete-activity-use";
 const REMOTE_SPELL_AUTO_ROLL_DAMAGE_MODE = "saveOnly";
 const LOCAL_GM_SPELL_WORKFLOW_MODE = "local-gm-native-spell-use";
 const REMOTE_TV_SPELL_WORKFLOW_SOURCE = "remote-tv";
 const LOCAL_GM_SPELL_WORKFLOW_SOURCE = "local-gm";
+const SECONDARY_AOE_MODULE_ID = "foundryvtt-dnd5e-aoe-secondary";
+const SECONDARY_AOE_FLAG_KEY = "secondaryAoe";
 const REMOTE_SPELL_ACTIVITY_MARKERS = new Map();
 const LOCAL_GM_SPELL_WORKFLOW_MONITORS = new Map();
 let spellWorkflowComparisonHooksRegistered = false;
+let secondaryAoeActivityObserversRegistered = false;
+let remoteActionAutoHitWorkflowClass = null;
 
 function getRequestActionType(request) {
   return request?.actionType ?? request?.payload?.actionType ?? "unknown";
@@ -123,6 +127,84 @@ function validateDocumentUuidRequest(request, fieldName, actionType) {
   };
 }
 
+function validateRelayActivityUseRequest(request) {
+  const payload = request?.payload;
+  const errors = [];
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return {
+      ok: false,
+      errors: ["payload must be an object for actionType 'relay-activity-use'."],
+      normalizedPayload: null
+    };
+  }
+
+  const normalizedPayload = {};
+  const requiredStringFields = ["itemUuid", "activityUuid"];
+  const optionalStringFields = ["sourceActorUuid", "sourceTokenUuid"];
+
+  for (const field of requiredStringFields) {
+    if (typeof payload[field] !== "string" || !payload[field].trim()) {
+      errors.push(`${field} is required and must be a non-empty string for actionType 'relay-activity-use'.`);
+    } else {
+      normalizedPayload[field] = payload[field].trim();
+    }
+  }
+
+  for (const field of optionalStringFields) {
+    if (payload[field] === undefined || payload[field] === null || payload[field] === "") continue;
+
+    if (typeof payload[field] !== "string" || !payload[field].trim()) {
+      errors.push(`${field} must be a non-empty string when provided for actionType 'relay-activity-use'.`);
+    } else {
+      normalizedPayload[field] = payload[field].trim();
+    }
+  }
+
+  if (payload.targetTokenUuids !== undefined) {
+    if (!Array.isArray(payload.targetTokenUuids)) {
+      errors.push("targetTokenUuids must be an array of strings when provided for actionType 'relay-activity-use'.");
+    } else {
+      normalizedPayload.targetTokenUuids = payload.targetTokenUuids
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .filter(Boolean);
+    }
+  } else {
+    normalizedPayload.targetTokenUuids = [];
+  }
+
+  if (payload.options !== undefined && (!payload.options || typeof payload.options !== "object" || Array.isArray(payload.options))) {
+    errors.push("options must be an object when provided for actionType 'relay-activity-use'.");
+  } else {
+    normalizedPayload.options = payload.options ?? {};
+  }
+
+  if (payload.context !== undefined && (!payload.context || typeof payload.context !== "object" || Array.isArray(payload.context))) {
+    errors.push("context must be an object when provided for actionType 'relay-activity-use'.");
+  } else {
+    normalizedPayload.context = payload.context ?? {};
+  }
+
+  normalizedPayload.aoeSecondaryExecution = Boolean(
+    payload.aoeSecondaryExecution
+    ?? payload.options?.aoeSecondaryExecution
+    ?? payload.context?.aoeSecondaryExecution
+  );
+
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      errors,
+      normalizedPayload: null
+    };
+  }
+
+  return {
+    ok: true,
+    errors: [],
+    normalizedPayload
+  };
+}
 function getSheetState(sheet) {
   return {
     hasSheet: Boolean(sheet),
@@ -196,6 +278,419 @@ function getActivitySummary(activity, usageConfig) {
     activityName: activity?.name ?? null,
     activityType: activity?.type ?? activity?.metadata?.type ?? activity?.constructor?.name ?? null,
     requiresDialog
+  };
+}
+
+function summarizeActivityIdentity(activity) {
+  return {
+    id: String(activity?.id ?? activity?._id ?? ""),
+    uuid: activity?.uuid ?? null,
+    name: activity?.name ?? null,
+    type: activity?.type ?? activity?.metadata?.type ?? activity?.constructor?.name ?? null
+  };
+}
+
+function getSecondaryAoeDiagnostic(item) {
+  const rawConfig = item?.getFlag?.(SECONDARY_AOE_MODULE_ID, SECONDARY_AOE_FLAG_KEY) ?? {};
+  const itemActivities = getItemActivities(item).map((activity) => summarizeActivityIdentity(activity));
+  const firstItemActivity = itemActivities[0] ?? null;
+  const secondaryActivityId = String(rawConfig?.secondaryActivityId ?? "");
+  const secondaryActivity = itemActivities.find((activity) => activity.id === secondaryActivityId) ?? null;
+
+  return {
+    aoeModuleActive: Boolean(game.modules?.get(SECONDARY_AOE_MODULE_ID)?.active),
+    aoeEnabled: Boolean(rawConfig?.enabled),
+    aoeTrigger: rawConfig?.trigger ?? null,
+    secondaryActivityId,
+    secondaryActivityUuid: secondaryActivity?.uuid ?? null,
+    secondaryActivityName: secondaryActivity?.name ?? null,
+    secondaryActivityType: secondaryActivity?.type ?? null,
+    firstItemActivityId: firstItemActivity?.id ?? "",
+    firstItemActivityUuid: firstItemActivity?.uuid ?? null,
+    firstItemActivityName: firstItemActivity?.name ?? null,
+    firstItemActivityType: firstItemActivity?.type ?? null,
+    itemActivityIds: itemActivities.map((activity) => activity.id),
+    itemActivities
+  };
+}
+
+function getWorkflowItemCard(workflow) {
+  if (workflow?.itemCard) return workflow.itemCard;
+  if (!workflow?.itemCardUuid) return null;
+
+  try {
+    return fromUuidSync(workflow.itemCardUuid) ?? null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function getRemoteActionExecutionMetadata(workflow) {
+  const itemCard = getWorkflowItemCard(workflow);
+  const remoteActionExecution = Boolean(
+    workflow?.remoteActionExecution
+    ?? workflow?.options?.remoteActionExecution
+    ?? workflow?.workflowOptions?.remoteActionExecution
+    ?? workflow?.midiOptions?.remoteActionExecution
+    ?? itemCard?.getFlag?.(MODULE_ID, "remoteActionExecution")
+    ?? itemCard?.flags?.[MODULE_ID]?.remoteActionExecution
+  );
+  const remoteActionExecutionMode = itemCard?.getFlag?.(MODULE_ID, "remoteActionExecutionMode")
+    ?? itemCard?.flags?.[MODULE_ID]?.remoteActionExecutionMode
+    ?? null;
+
+  return {
+    remoteActionExecution,
+    remoteActionExecutionMode,
+    itemCardUuid: itemCard?.uuid ?? workflow?.itemCardUuid ?? null
+  };
+}
+
+function getNativeExecutionPathFromExecutionMode(executionMode = null) {
+  if (executionMode?.includes(":activity.use")) return "activity.use";
+  if (executionMode?.includes("item.use")) return "item.use";
+  return null;
+}
+
+function getSecondaryAoeModuleApi() {
+  return game.modules?.get(SECONDARY_AOE_MODULE_ID)?.api ?? null;
+}
+
+function summarizeSecondaryAoePlan(plan) {
+  if (!plan || typeof plan !== "object") return null;
+
+  return {
+    ready: Boolean(plan.ready),
+    reason: plan.reason ?? null,
+    primaryActivityId: String(plan.primaryActivityId ?? ""),
+    secondaryActivityId: String(plan.secondaryActivityId ?? ""),
+    primaryActivityUuid: plan.primaryActivity?.uuid ?? null,
+    secondaryActivityUuid: plan.secondaryActivity?.uuid ?? null,
+    secondaryTargetCount: Number(plan.secondaryTargetCount ?? 0),
+    hook: plan.debug?.midi?.hook ?? null,
+    trigger: plan.debug?.midi?.trigger ?? null,
+    itemUuid: plan.debug?.midi?.itemUuid ?? null,
+    itemName: plan.debug?.midi?.itemName ?? null
+  };
+}
+
+function summarizeSecondaryAoeExecutionResult(result) {
+  if (!result || typeof result !== "object") return null;
+
+  return {
+    executed: Boolean(result.executed),
+    reason: result.reason ?? null,
+    primaryActivityId: String(result.primaryActivityId ?? ""),
+    secondaryActivityId: String(result.secondaryActivityId ?? ""),
+    usedActivityId: String(result.usedActivityId ?? ""),
+    attemptedTargetCount: Number(result.attemptedTargetCount ?? 0),
+    consumptionSuppressed: Boolean(result.consumptionSuppressed),
+    hook: result.resultSummary?.hook ?? null,
+    trigger: result.resultSummary?.trigger ?? null,
+    triggerReason: result.resultSummary?.triggerReason ?? null
+  };
+}
+
+function getSecondaryAoeRuntimeSnapshot() {
+  const api = getSecondaryAoeModuleApi();
+  const apiErrors = [];
+  let lastPlan = null;
+  let lastExecutionResult = null;
+
+  if (api) {
+    if (typeof api.getLastMidiSecondaryAoePlan === "function") {
+      try {
+        lastPlan = api.getLastMidiSecondaryAoePlan();
+      } catch (error) {
+        apiErrors.push(`getLastMidiSecondaryAoePlan:${error?.message ?? String(error)}`);
+      }
+    }
+
+    if (typeof api.getLastMidiSecondaryAoeExecutionResult === "function") {
+      try {
+        lastExecutionResult = api.getLastMidiSecondaryAoeExecutionResult();
+      } catch (error) {
+        apiErrors.push(`getLastMidiSecondaryAoeExecutionResult:${error?.message ?? String(error)}`);
+      }
+    }
+  }
+
+  return {
+    apiAvailable: Boolean(api),
+    apiErrors,
+    lastPlan: summarizeSecondaryAoePlan(lastPlan),
+    lastExecutionResult: summarizeSecondaryAoeExecutionResult(lastExecutionResult)
+  };
+}
+
+function buildFlatSecondaryAoeRuntimeSnapshotLogData(runtimeSnapshot = {}) {
+  const lastPlan = runtimeSnapshot?.lastPlan ?? null;
+  const lastExecutionResult = runtimeSnapshot?.lastExecutionResult ?? null;
+
+  return {
+    secondaryAoePlanReady: lastPlan?.ready ?? null,
+    secondaryAoePlanReason: lastPlan?.reason ?? null,
+    secondaryAoePlanPrimaryActivityId: lastPlan?.primaryActivityId ?? "",
+    secondaryAoePlanSecondaryActivityId: lastPlan?.secondaryActivityId ?? "",
+    secondaryAoePlanPrimaryActivityUuid: lastPlan?.primaryActivityUuid ?? null,
+    secondaryAoePlanSecondaryActivityUuid: lastPlan?.secondaryActivityUuid ?? null,
+    secondaryAoePlanSecondaryTargetCount: lastPlan?.secondaryTargetCount ?? 0,
+    secondaryAoePlanHook: lastPlan?.hook ?? null,
+    secondaryAoePlanTrigger: lastPlan?.trigger ?? null,
+    secondaryAoePlanJson: serializeDiagnosticValue(lastPlan),
+    secondaryAoeExecutionExecuted: lastExecutionResult?.executed ?? null,
+    secondaryAoeExecutionReason: lastExecutionResult?.reason ?? null,
+    secondaryAoeExecutionPrimaryActivityId: lastExecutionResult?.primaryActivityId ?? "",
+    secondaryAoeExecutionSecondaryActivityId: lastExecutionResult?.secondaryActivityId ?? "",
+    secondaryAoeExecutionUsedActivityId: lastExecutionResult?.usedActivityId ?? "",
+    secondaryAoeExecutionAttemptedTargetCount: lastExecutionResult?.attemptedTargetCount ?? 0,
+    secondaryAoeExecutionConsumptionSuppressed: lastExecutionResult?.consumptionSuppressed ?? null,
+    secondaryAoeExecutionHook: lastExecutionResult?.hook ?? null,
+    secondaryAoeExecutionTrigger: lastExecutionResult?.trigger ?? null,
+    secondaryAoeExecutionTriggerReason: lastExecutionResult?.triggerReason ?? null,
+    secondaryAoeExecutionJson: serializeDiagnosticValue(lastExecutionResult)
+  };
+}
+
+function shouldObserveAoeHookWorkflow(workflow) {
+  const item = workflow?.item ?? workflow?.activity?.item ?? null;
+  if (!item) return false;
+
+  const aoe = getSecondaryAoeDiagnostic(item);
+  const executionMetadata = getRemoteActionExecutionMetadata(workflow);
+  return aoe.aoeEnabled || executionMetadata.remoteActionExecution;
+}
+
+function buildAoeHookObserverLogData(workflow, hookName, hookStage) {
+  const item = workflow?.item ?? workflow?.activity?.item ?? null;
+  const executionMetadata = getRemoteActionExecutionMetadata(workflow);
+  const runtimeSnapshot = getSecondaryAoeRuntimeSnapshot();
+  const aoeObservationEligible = shouldObserveAoeHookWorkflow(workflow);
+
+  return {
+    hookName,
+    hookStage,
+    aoeObservationEligible,
+    ...buildAoeDiagnosticLogData({
+      item,
+      launchedActivity: workflow?.activity ?? null,
+      workflow,
+      stage: `${hookName}:${hookStage}`,
+      nativeExecutionPath: getNativeExecutionPathFromExecutionMode(executionMetadata.remoteActionExecutionMode),
+      workflowMode: executionMetadata.remoteActionExecutionMode ?? null,
+      executionMode: executionMetadata.remoteActionExecutionMode ?? null
+    }),
+    remoteActionExecution: executionMetadata.remoteActionExecution,
+    remoteActionExecutionMode: executionMetadata.remoteActionExecutionMode,
+    remoteActionItemCardUuid: executionMetadata.itemCardUuid,
+    workflowSummary: summarizeMidiWorkflow(workflow),
+    secondaryAoeApiAvailable: runtimeSnapshot.apiAvailable,
+    secondaryAoeApiErrors: runtimeSnapshot.apiErrors,
+    ...buildFlatSecondaryAoeRuntimeSnapshotLogData(runtimeSnapshot),
+    secondaryAoeLastPlan: runtimeSnapshot.lastPlan,
+    secondaryAoeLastExecutionResult: runtimeSnapshot.lastExecutionResult
+  };
+}
+
+function buildAoeHookEntryLogData(workflow, hookName) {
+  const item = workflow?.item ?? workflow?.activity?.item ?? null;
+
+  return {
+    hookName,
+    itemUuid: item?.uuid ?? null,
+    activityUuid: workflow?.activity?.uuid ?? null,
+    currentUserId: game.user?.id ?? null,
+    isGM: Boolean(game.user?.isGM)
+  };
+}
+
+function observeAoeHookWorkflow(workflow, hookName) {
+  logInfo(`Remote Action AOE hook observer at ${hookName}.`, buildAoeHookObserverLogData(workflow, hookName, "entry"));
+
+  setTimeout(() => {
+    logInfo(`Remote Action AOE hook observer after ${hookName}.`, buildAoeHookObserverLogData(workflow, hookName, "after-hook"));
+  }, 0);
+}
+
+function shouldObserveSecondaryAoeActivity(activity) {
+  const item = activity?.item ?? activity?.parent ?? null;
+  if (!(item instanceof Item)) return false;
+  return getSecondaryAoeDiagnostic(item).aoeEnabled;
+}
+
+function buildAoeActivityHookLogData(activity, hookName, hookStage, extra = {}) {
+  const item = activity?.item ?? activity?.parent ?? null;
+  const runtimeSnapshot = getSecondaryAoeRuntimeSnapshot();
+
+  return {
+    hookName,
+    hookStage,
+    currentUserId: game.user?.id ?? null,
+    currentUserName: game.user?.name ?? null,
+    isGM: Boolean(game.user?.isGM),
+    ...buildAoeDiagnosticLogData({
+      item,
+      launchedActivity: activity ?? null,
+      stage: `${hookName}:${hookStage}`
+    }),
+    secondaryAoeApiAvailable: runtimeSnapshot.apiAvailable,
+    secondaryAoeApiErrors: runtimeSnapshot.apiErrors,
+    ...buildFlatSecondaryAoeRuntimeSnapshotLogData(runtimeSnapshot),
+    secondaryAoeLastPlan: runtimeSnapshot.lastPlan,
+    secondaryAoeLastExecutionResult: runtimeSnapshot.lastExecutionResult,
+    ...extra
+  };
+}
+
+function observeSecondaryAoeActivityHook(activity, hookName, extra = {}) {
+  if (!shouldObserveSecondaryAoeActivity(activity)) return;
+
+  logInfo(`Remote Action AOE activity hook observed at ${hookName}.`, buildAoeActivityHookLogData(activity, hookName, "entry", extra));
+
+  setTimeout(() => {
+    logInfo(`Remote Action AOE activity hook observed after ${hookName}.`, buildAoeActivityHookLogData(activity, hookName, "after-hook", extra));
+  }, 0);
+}
+
+function buildPrimaryWorkflowAoeApiSnapshotExportText(logPayload = {}) {
+  return serializeDiagnosticValue({
+    secondaryAoePlanReady: logPayload.secondaryAoePlanReady ?? null,
+    secondaryAoePlanReason: logPayload.secondaryAoePlanReason ?? null,
+    secondaryAoePlanPrimaryActivityId: logPayload.secondaryAoePlanPrimaryActivityId ?? "",
+    secondaryAoePlanSecondaryActivityId: logPayload.secondaryAoePlanSecondaryActivityId ?? "",
+    secondaryAoeExecutionReason: logPayload.secondaryAoeExecutionReason ?? null,
+    secondaryAoeExecutionPrimaryActivityId: logPayload.secondaryAoeExecutionPrimaryActivityId ?? "",
+    secondaryAoeExecutionSecondaryActivityId: logPayload.secondaryAoeExecutionSecondaryActivityId ?? "",
+    secondaryAoePlanJson: logPayload.secondaryAoePlanJson ?? null,
+    secondaryAoeExecutionJson: logPayload.secondaryAoeExecutionJson ?? null
+  });
+}
+
+function logAoeApiSnapshotAfterPrimaryWorkflow({
+  item,
+  activity,
+  workflow = null,
+  resultSummary = null,
+  attemptedMethod = null,
+  workflowMode = null,
+  hookSource = null
+} = {}) {
+  if (!item || !getSecondaryAoeDiagnostic(item).aoeEnabled) return;
+
+  const buildPayload = (snapshotStage) => {
+    const runtimeSnapshot = getSecondaryAoeRuntimeSnapshot();
+
+    return {
+      snapshotStage,
+      hookSource,
+      currentUserId: game.user?.id ?? null,
+      currentUserName: game.user?.name ?? null,
+      isGM: Boolean(game.user?.isGM),
+      ...buildAoeDiagnosticLogData({
+        item,
+        launchedActivity: activity ?? null,
+        workflow,
+        stage: `primary-workflow-resolution:${snapshotStage}`,
+        attemptedMethod,
+        workflowMode,
+        executionMode: workflowMode
+      }),
+      workflowSummary: summarizeMidiWorkflow(workflow),
+      resultSummary,
+      secondaryAoeApiAvailable: runtimeSnapshot.apiAvailable,
+      secondaryAoeApiErrors: runtimeSnapshot.apiErrors,
+      ...buildFlatSecondaryAoeRuntimeSnapshotLogData(runtimeSnapshot),
+      secondaryAoeLastPlan: runtimeSnapshot.lastPlan,
+      secondaryAoeLastExecutionResult: runtimeSnapshot.lastExecutionResult
+    };
+  };
+
+  const entryPayload = buildPayload("entry");
+  logInfo(`Remote Action AOE API snapshot after primary workflow resolution. ${buildPrimaryWorkflowAoeApiSnapshotExportText(entryPayload)}`);
+
+  setTimeout(() => {
+    const afterTickPayload = buildPayload("after-tick");
+    logInfo(`Remote Action AOE API snapshot after primary workflow resolution tick. ${buildPrimaryWorkflowAoeApiSnapshotExportText(afterTickPayload)}`);
+  }, 0);
+}
+
+function buildAoeDiagnosticLogData({
+  item,
+  launchedActivity = null,
+  workflow = null,
+  stage = null,
+  relayEntryPoint = null,
+  nativeExecutionPath = null,
+  actionType = null,
+  attemptedMethod = null,
+  workflowMode = null,
+  executionMode = null
+} = {}) {
+  const itemDocument = item ?? workflow?.item ?? null;
+  const launched = summarizeActivityIdentity(launchedActivity);
+  const workflowActivity = summarizeActivityIdentity(workflow?.activity ?? null);
+  const aoe = getSecondaryAoeDiagnostic(itemDocument);
+  const predictedPrimaryActivityId = launched.id || "";
+  const workflowPrimaryActivityId = workflowActivity.id || "";
+
+  return {
+    stage,
+    actionType,
+    relayEntryPoint,
+    nativeExecutionPath,
+    attemptedMethod,
+    workflowMode,
+    executionMode,
+    itemUuid: itemDocument?.uuid ?? null,
+    itemName: itemDocument?.name ?? null,
+    launchedActivityId: launched.id,
+    launchedActivityUuid: launched.uuid,
+    launchedActivityName: launched.name,
+    launchedActivityType: launched.type,
+    workflowActivityId: workflowActivity.id,
+    workflowActivityUuid: workflowActivity.uuid,
+    workflowActivityName: workflowActivity.name,
+    workflowActivityType: workflowActivity.type,
+    secondaryActivityId: aoe.secondaryActivityId,
+    secondaryActivityUuid: aoe.secondaryActivityUuid,
+    secondaryActivityName: aoe.secondaryActivityName,
+    secondaryActivityType: aoe.secondaryActivityType,
+    firstItemActivityId: aoe.firstItemActivityId,
+    firstItemActivityUuid: aoe.firstItemActivityUuid,
+    firstItemActivityName: aoe.firstItemActivityName,
+    firstItemActivityType: aoe.firstItemActivityType,
+    itemActivityIds: aoe.itemActivityIds,
+    itemActivities: aoe.itemActivities,
+    aoeModuleActive: aoe.aoeModuleActive,
+    aoeEnabled: aoe.aoeEnabled,
+    aoeTrigger: aoe.aoeTrigger,
+    predictedPrimaryActivityId,
+    predictedDuplicateWithSecondary: Boolean(
+      aoe.secondaryActivityId
+      && predictedPrimaryActivityId
+      && (aoe.secondaryActivityId === predictedPrimaryActivityId)
+    ),
+    midiWorkflowPrimaryActivityId: workflowPrimaryActivityId,
+    midiWorkflowDuplicateWithSecondary: Boolean(
+      aoe.secondaryActivityId
+      && workflowPrimaryActivityId
+      && (aoe.secondaryActivityId === workflowPrimaryActivityId)
+    ),
+    launchedMatchesSecondary: Boolean(
+      aoe.secondaryActivityId
+      && launched.id
+      && (aoe.secondaryActivityId === launched.id)
+    ),
+    workflowMatchesSecondary: Boolean(
+      aoe.secondaryActivityId
+      && workflowActivity.id
+      && (aoe.secondaryActivityId === workflowActivity.id)
+    ),
+    workflowMatchesLaunched: Boolean(
+      launched.id
+      && workflowActivity.id
+      && (launched.id === workflowActivity.id)
+    )
   };
 }
 
@@ -273,10 +768,314 @@ function normalizeWorkflowParticipants(participants = {}) {
 function isThenable(value) {
   return typeof value?.then === "function";
 }
+
+function cloneExecutionConfig(config = {}) {
+  return (config && typeof config === "object" && !Array.isArray(config))
+    ? foundry.utils.deepClone(config)
+    : {};
+}
+
+function applyRemoteActionExecutionFlags(config, executionMode) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return config;
+
+  config.remoteActionExecution = true;
+  foundry.utils.setProperty(config, `flags.${MODULE_ID}.remoteActionExecution`, true);
+
+  if (executionMode) {
+    foundry.utils.setProperty(config, `flags.${MODULE_ID}.remoteActionExecutionMode`, executionMode);
+  }
+
+  return config;
+}
+
+function buildRemoteActionExecutionConfigs(usage = {}, dialog = {}, message = {}, { executionMode = "remote-action" } = {}) {
+  const usagePayload = applyRemoteActionExecutionFlags(cloneExecutionConfig(usage), executionMode);
+  const dialogConfig = applyRemoteActionExecutionFlags(cloneExecutionConfig(dialog), executionMode);
+  const messageConfig = applyRemoteActionExecutionFlags(cloneExecutionConfig(message), executionMode);
+
+  foundry.utils.setProperty(usagePayload, "context.remoteActionExecution", true);
+  foundry.utils.setProperty(usagePayload, "workflowOptions.remoteActionExecution", true);
+  foundry.utils.setProperty(usagePayload, "midiOptions.remoteActionExecution", true);
+  foundry.utils.setProperty(usagePayload, "midiOptions.workflowOptions.remoteActionExecution", true);
+  foundry.utils.setProperty(messageConfig, `data.flags.${MODULE_ID}.remoteActionExecution`, true);
+
+  if (executionMode) {
+    foundry.utils.setProperty(messageConfig, `data.flags.${MODULE_ID}.remoteActionExecutionMode`, executionMode);
+  }
+
+  return {
+    usagePayload,
+    dialogConfig,
+    messageConfig
+  };
+}
+
+function getCurrentUserTargetIds() {
+  return Array.from(game.user?.targets ?? []).map((token) => token?.id).filter(Boolean);
+}
+
+function applyUserTargetIds(tokenIds) {
+  if (typeof game.user?.updateTokenTargets === "function") {
+    game.user.updateTokenTargets(tokenIds);
+    return;
+  }
+
+  const desired = new Set(tokenIds ?? []);
+  for (const token of canvas?.tokens?.placeables ?? []) {
+    token.setTarget(desired.has(token.id), {
+      user: game.user,
+      releaseOthers: false,
+      groupSelection: true
+    });
+  }
+}
+
+async function resolveUuidDocumentSafely(uuid) {
+  if (typeof uuid !== "string" || !uuid.trim()) return null;
+
+  try {
+    return await fromUuid(uuid.trim());
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function resolveWorkflowToken(uuid) {
+  const resolved = await resolveUuidDocumentSafely(uuid);
+  return resolved?.object ?? resolved ?? null;
+}
+
+function getItemActivities(item) {
+  if (typeof item?.system?.activities?.filter === "function") {
+    return item.system.activities.filter(() => true);
+  }
+
+  if (Array.isArray(item?.system?.activities?.contents)) {
+    return item.system.activities.contents.filter(Boolean);
+  }
+
+  if (Array.isArray(item?.system?.activities)) {
+    return item.system.activities.filter(Boolean);
+  }
+
+  return [];
+}
+
+async function resolveItemActivity(item, activityUuid) {
+  const resolvedByUuid = await resolveUuidDocumentSafely(activityUuid);
+  if (resolvedByUuid) return resolvedByUuid;
+
+  const normalizedActivityUuid = String(activityUuid ?? "").trim();
+  const fallbackId = normalizedActivityUuid.split(".").pop();
+  const activities = getItemActivities(item);
+
+  return activities.find((activity) => {
+    const activityId = String(activity?.id ?? activity?._id ?? "");
+    const activityDocumentUuid = String(activity?.uuid ?? "");
+    return activityDocumentUuid === normalizedActivityUuid
+      || activityId === normalizedActivityUuid
+      || activityId === fallbackId;
+  }) ?? null;
+}
+
+async function resolveExplicitWorkflowParticipants(item, payload = {}) {
+  const sourceActorDocument = payload?.sourceActorUuid
+    ? await resolveUuidDocumentSafely(payload.sourceActorUuid)
+    : item?.actor ?? null;
+  const sourceActor = sourceActorDocument?.actor ?? sourceActorDocument ?? item?.actor ?? null;
+
+  let sourceToken = payload?.sourceTokenUuid
+    ? await resolveWorkflowToken(payload.sourceTokenUuid)
+    : null;
+  let sourceResolution = sourceToken
+    ? "payload-source-token"
+    : payload?.sourceActorUuid
+      ? "payload-source-actor"
+      : "item-actor-default";
+
+  if (!sourceToken) {
+    const actorActiveToken = sourceActor?.getActiveTokens?.()?.[0] ?? null;
+    if (actorActiveToken) {
+      sourceToken = actorActiveToken;
+      sourceResolution = payload?.sourceActorUuid
+        ? "payload-source-actor-active-token-fallback"
+        : "item-actor-active-token-fallback";
+    }
+  }
+
+  const targetUuids = Array.isArray(payload?.targetTokenUuids) ? payload.targetTokenUuids : [];
+  const resolvedTargets = await Promise.all(targetUuids.map((targetUuid) => resolveWorkflowToken(targetUuid)));
+
+  return normalizeWorkflowParticipants({
+    sourceActor,
+    sourceToken,
+    sourceResolution,
+    controlledTokens: [],
+    targets: resolvedTargets.filter(Boolean)
+  });
+}
+
+function buildExplicitActivityExecutionConfig(payload = {}) {
+  const usagePayload = foundry.utils.deepClone(payload?.options?.usage ?? {});
+  const dialogConfig = foundry.utils.deepClone(payload?.options?.dialog ?? { configure: false });
+  const messageConfig = foundry.utils.deepClone(payload?.options?.message ?? {});
+  const aoeSecondaryExecution = Boolean(payload?.aoeSecondaryExecution);
+  const bridgeModuleId = payload?.context?.bridgeModuleId ?? null;
+
+  if (aoeSecondaryExecution) {
+    usagePayload.aoeSecondaryExecution = true;
+    foundry.utils.setProperty(usagePayload, "workflowOptions.aoeSecondaryExecution", true);
+    foundry.utils.setProperty(usagePayload, "midiOptions.aoeSecondaryExecution", true);
+
+    if (bridgeModuleId) {
+      foundry.utils.setProperty(usagePayload, `flags.${bridgeModuleId}.aoeSecondaryExecution`, true);
+      foundry.utils.setProperty(messageConfig, `flags.${bridgeModuleId}.aoeSecondaryExecution`, true);
+    }
+  }
+
+  if (dialogConfig.configure === undefined) {
+    dialogConfig.configure = false;
+  }
+
+  const executionConfigs = buildRemoteActionExecutionConfigs(
+    usagePayload,
+    dialogConfig,
+    messageConfig,
+    { executionMode: "relay-activity-use" }
+  );
+
+  return {
+    usagePayload: executionConfigs.usagePayload,
+    dialogConfig: executionConfigs.dialogConfig,
+    messageConfig: executionConfigs.messageConfig,
+    aoeSecondaryExecution,
+    bridgeModuleId,
+    remoteActionExecution: true
+  };
+}
 function getMidiQolApi() {
   if (!game.modules?.get("midi-qol")?.active) return null;
   if (globalThis.MidiQOL?.DamageOnlyWorkflow) return globalThis.MidiQOL;
   return game.modules.get("midi-qol")?.api ?? null;
+}
+
+function getRemoteActionAutoHitWorkflowClass(midiApi = getMidiQolApi()) {
+  if (remoteActionAutoHitWorkflowClass) return remoteActionAutoHitWorkflowClass;
+
+  const BaseWorkflowClass = midiApi?.workflowClass ?? globalThis.MidiQOL?.workflowClass ?? null;
+  if (typeof BaseWorkflowClass !== "function") return null;
+
+  class RemoteActionAutoHitWorkflow extends BaseWorkflowClass {
+    static get forceCreate() {
+      return false;
+    }
+
+    get workflowType() {
+      return "RemoteActionAutoHitWorkflow";
+    }
+
+    async WorkflowState_WaitForAttackRoll(context = {}) {
+      if (context.attackRoll || !this.activity?.attack) {
+        return super.WorkflowState_WaitForAttackRoll(context);
+      }
+
+      this.rollOptions.fastForwardAttack = true;
+      this.rollOptions.autoRollAttack = true;
+      this.workflowOptions.fastForwardAttack = true;
+      this.workflowOptions.autoRollAttack = true;
+      this.workflowOptions.attackRollDSN = false;
+      this.workflowOptions.targetConfirmation ??= "none";
+
+      try {
+        const attackRolls = await this.activity.rollAttack?.(
+          {
+            event: this.rollOptions.event,
+            workflow: this,
+            midiOptions: {
+              ...this.rollOptions,
+              chatMessage: false,
+              isDummy: true,
+              fastForward: true,
+              fastForwardAttack: true,
+              autoRollAttack: true,
+              workflowOptions: this.workflowOptions
+            }
+          },
+          {},
+          {}
+        );
+
+        const firstAttackRoll = Array.isArray(attackRolls)
+          ? attackRolls[0] ?? null
+          : attackRolls ?? null;
+
+        if (firstAttackRoll) this.attackRoll = firstAttackRoll;
+      } catch (error) {
+        logWarning("Remote Action Midi auto-hit hidden attack roll failed.", {
+          workflowType: this.workflowType,
+          itemUuid: this.item?.uuid ?? null,
+          itemName: this.item?.name ?? null,
+          activityUuid: this.activity?.uuid ?? null,
+          activityName: this.activity?.name ?? null,
+          error: error?.message ?? String(error)
+        });
+      }
+
+      return this.WorkflowState_AttackRollComplete;
+    }
+
+    async processAttackRoll() {
+      if (this.activity?.attack && this.attackRoll && typeof super.processAttackRoll === "function") {
+        await super.processAttackRoll();
+      } else if (!this.activity?.attack && typeof super.processAttackRoll === "function") {
+        await super.processAttackRoll();
+      }
+
+      if (this.activity?.attack) {
+        this.isCritical = false;
+        this.isFumble = false;
+        this.attackTotal = Number.MAX_SAFE_INTEGER;
+      }
+
+      return this.attackRoll ?? null;
+    }
+
+    async checkHits(options = {}) {
+      const result = typeof super.checkHits === "function"
+        ? await super.checkHits(options)
+        : undefined;
+
+      if (this.activity?.attack) {
+        this.hitTargets = new Set(this.targets ?? []);
+        this.hitTargetsEC = new Set();
+      }
+
+      return result;
+    }
+
+    async displayAttackRoll(displayOptions = {}) {
+      if (!this.activity?.attack || typeof super.displayAttackRoll !== "function") {
+        return super.displayAttackRoll?.(displayOptions);
+      }
+
+      return this.chatCard ?? null;
+    }
+
+    async displayHits(whisper = false, showHits = true) {
+      if (this.activity?.attack && this.hitDisplayData && typeof this.hitDisplayData === "object") {
+        for (const hitData of Object.values(this.hitDisplayData)) {
+          if (!hitData?.target) continue;
+          hitData.isHit = this.hitTargets?.has(hitData.target) ?? false;
+          hitData.hitClass = hitData.isHit ? "success" : "failure";
+        }
+      }
+
+      return super.displayHits?.(whisper, showHits);
+    }
+  }
+
+  remoteActionAutoHitWorkflowClass = RemoteActionAutoHitWorkflow;
+  return remoteActionAutoHitWorkflowClass;
 }
 
 function getPrimaryDamageType(activity, roll) {
@@ -326,8 +1125,10 @@ function focusChatPanel(message, context = {}) {
 }
 
 function shouldUseManualHitDamageWorkflow(item, activity, workflowSettings) {
-  const isWeaponAttack = (item?.type === "weapon") && ((activity?.type ?? activity?.metadata?.type) === "attack");
-  return isWeaponAttack && !workflowSettings.useAttackRolls && workflowSettings.useDamageRolls;
+  const activityType = activity?.type ?? activity?.metadata?.type ?? null;
+  const isAttackActivity = activityType === "attack";
+
+  return isAttackActivity && !Boolean(workflowSettings?.useAttackRolls);
 }
 
 function getSpellWorkflowBranchProbe(item, activity, midiApi) {
@@ -389,6 +1190,114 @@ function buildRemoteSpellUsage(activity, activitySummary, workflowSettings) {
   };
 }
 
+function getActivityDamageKinds(activity) {
+  const parts = activity?.damage?.parts ?? [];
+  const types = new Set();
+
+  for (const part of parts) {
+    const partTypes = part?.types;
+    if (Array.isArray(partTypes)) {
+      for (const type of partTypes) {
+        if (type) types.add(type);
+      }
+    } else if (partTypes instanceof Set) {
+      for (const type of partTypes) {
+        if (type) types.add(type);
+      }
+    }
+  }
+
+  return Array.from(types);
+}
+
+function classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi) {
+  const activityType = activity?.type ?? activity?.metadata?.type ?? null;
+  const activitySummary = getActivitySummary(activity, {});
+  const actionType = activity?.attack?.type ?? item?.system?.actionType ?? item?.system?.activation?.type ?? null;
+  const damageKinds = getActivityDamageKinds(activity);
+  const hasDamage = Boolean(activity?.hasDamage);
+  const hasTemplate = Boolean(activity?.target?.template?.type);
+  const isAttackActivity = activityType === "attack";
+  const isSaveActivity = activityType === "save";
+  const isCheckActivity = activityType === "check";
+  const isSpellItem = (item?.type === "spell") || Boolean(activity?.isSpell);
+  const isWeaponItem = item?.type === "weapon";
+  const isSpellAttack = isAttackActivity && isSpellItem;
+  const spellWorkflowProbe = getSpellWorkflowBranchProbe(item, activity, midiApi);
+
+  let actionFamily = "utility";
+  if (isWeaponItem && isAttackActivity && ["rwak", "rsak"].includes(actionType)) {
+    actionFamily = "ranged-attack-simple";
+  } else if (isWeaponItem && isAttackActivity) {
+    actionFamily = "weapon-attack-simple";
+  } else if (isSpellAttack) {
+    actionFamily = "spell-attack";
+  } else if (isSaveActivity && hasTemplate && hasDamage) {
+    actionFamily = "save-template-damage";
+  } else if (isSaveActivity && hasTemplate) {
+    actionFamily = "save-template";
+  } else if (isSaveActivity) {
+    actionFamily = "save";
+  } else if (isCheckActivity) {
+    actionFamily = "check";
+  } else if (activityType === "heal" || damageKinds.includes("healing")) {
+    actionFamily = "heal";
+  } else if (hasDamage) {
+    actionFamily = "damage";
+  }
+
+  let strategy = "native-foundry";
+  if (shouldUseManualHitDamageWorkflow(item, activity, workflowSettings)) {
+    strategy = "midi-auto-hit";
+  } else if (spellWorkflowProbe.shouldUseMidiSpellWorkflow) {
+    strategy = "midi-spell";
+  }
+
+  return {
+    actionFamily,
+    strategy,
+    itemType: item?.type ?? null,
+    activityType,
+    actionType,
+    hasDamage,
+    hasTemplate,
+    templateType: activity?.target?.template?.type ?? null,
+    isSpellItem,
+    isWeaponItem,
+    isAttackActivity,
+    isSaveActivity,
+    isCheckActivity,
+    isSpellAttack,
+    damageKinds,
+    requiresDialog: activitySummary.requiresDialog,
+    spellWorkflowProbe
+  };
+}
+
+async function routeRemoteActivityWorkflow(item, activity, participants, options = {}) {
+  const {
+    workflowSettings = getWorkflowSettings(),
+    midiApi = getMidiQolApi(),
+    classification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi)
+  } = options;
+
+  switch (classification.strategy) {
+    case "midi-auto-hit":
+      return startMidiAutoHitActivityWorkflow(item, activity, participants, {
+        workflowMode: MANUAL_HIT_WORKFLOW_MODE,
+        workflowSettings,
+        midiApi
+      });
+    case "midi-spell":
+      return startMidiCompleteActivityWorkflow(item, activity, participants, {
+        workflowSettings,
+        midiApi
+      });
+    default:
+      return null;
+  }
+}
+
 function getSpellWorkflowMonitorLabel(monitorSource) {
   return monitorSource === LOCAL_GM_SPELL_WORKFLOW_SOURCE
     ? "Local GM spell workflow"
@@ -442,6 +1351,10 @@ function summarizeMidiWorkflow(workflow) {
     workflowId: workflow?.id ?? null,
     workflowName: workflow?.workflowName ?? workflow?.constructor?.name ?? null,
     workflowCurrentAction: getWorkflowStateLabel(workflow?.currentAction),
+    workflowActivityId: String(workflow?.activity?.id ?? workflow?.activity?._id ?? ""),
+    workflowActivityUuid: workflow?.activity?.uuid ?? null,
+    workflowActivityName: workflow?.activity?.name ?? null,
+    workflowActivityType: workflow?.activity?.type ?? workflow?.activity?.metadata?.type ?? null,
     itemCardUuid: workflow?.itemCardUuid ?? null,
     templateUuid: workflow?.templateUuid ?? null,
     targetCount: workflow?.targets?.size ?? 0,
@@ -1761,6 +2674,17 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
     shouldForceRemoteSpellDamageRoll,
     remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
   });
+  logDebug("Remote Action AOE diagnostic before remote spell item.use replacement.", buildAoeDiagnosticLogData({
+    item,
+    launchedActivity: activity,
+    stage: "before-launch",
+    actionType: "open-item-use-dialog",
+    relayEntryPoint: "open-item-use-dialog",
+    nativeExecutionPath: "item.use",
+    attemptedMethod: "item.use",
+    workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+    executionMode: MIDI_SPELL_WORKFLOW_MODE
+  }));
   let workflowPromise;
   try {
     markRemoteSpellActivity(activity?.uuid);
@@ -1777,7 +2701,29 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
       remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
     });
 
-    workflowPromise = item.use(remoteSpellUsage, { configure: true }, { create: true });
+    const remoteExecutionConfigs = buildRemoteActionExecutionConfigs(
+      remoteSpellUsage,
+      { configure: true },
+      { create: true },
+      { executionMode: MIDI_SPELL_WORKFLOW_MODE }
+    );
+
+    logDebug("Prepared remoteActionExecution marker for remote spell workflow native execution.", {
+      itemUuid: item.uuid,
+      itemName: item.name,
+      activityUuid: activity?.uuid ?? null,
+      activityName: activitySummary.activityName,
+      activityType: activitySummary.activityType,
+      executionMode: MIDI_SPELL_WORKFLOW_MODE,
+      shouldForceRemoteSpellDamageRoll,
+      remoteSpellWorkflowOptions: remoteSpellWorkflowOptions
+    });
+
+    workflowPromise = item.use(
+      remoteExecutionConfigs.usagePayload,
+      remoteExecutionConfigs.dialogConfig,
+      remoteExecutionConfigs.messageConfig
+    );
 
     if (!isThenable(workflowPromise)) {
       throw new Error("item.use did not return a promise.");
@@ -1885,6 +2831,15 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
       chatFocusActions,
       resultSummary,
       workflowSummary
+    });
+    logAoeApiSnapshotAfterPrimaryWorkflow({
+      item,
+      activity,
+      workflow,
+      resultSummary,
+      attemptedMethod: "item.use",
+      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
+      hookSource: "remote-spell-item.use"
     });
     clearRemoteSpellActivity(activity?.uuid);
   }).catch((error) => {
@@ -2007,6 +2962,54 @@ async function startMidiCompleteActivityWorkflow(item, activity, participants, o
   };
 }
 
+export function registerSecondaryAoeActivityObservers() {
+  if (secondaryAoeActivityObserversRegistered) return;
+  secondaryAoeActivityObserversRegistered = true;
+
+  Hooks.on("dnd5e.preUseActivity", (activity, usageConfig) => {
+    if (!shouldObserveSecondaryAoeActivity(activity)) return;
+
+    logInfo("Remote Action AOE activity hook callback entered.", {
+      hookName: "dnd5e.preUseActivity",
+      itemUuid: activity?.item?.uuid ?? activity?.parent?.uuid ?? null,
+      activityUuid: activity?.uuid ?? null,
+      currentUserId: game.user?.id ?? null,
+      isGM: Boolean(game.user?.isGM)
+    });
+
+    observeSecondaryAoeActivityHook(activity, "dnd5e.preUseActivity", {
+      usageConfigSubsequentActions: usageConfig?.subsequentActions ?? null
+    });
+  });
+
+  Hooks.on("dnd5e.postUseActivity", (activity, usageConfig, results) => {
+    if (!shouldObserveSecondaryAoeActivity(activity)) return;
+
+    logInfo("Remote Action AOE activity hook callback entered.", {
+      hookName: "dnd5e.postUseActivity",
+      itemUuid: activity?.item?.uuid ?? activity?.parent?.uuid ?? null,
+      activityUuid: activity?.uuid ?? null,
+      currentUserId: game.user?.id ?? null,
+      isGM: Boolean(game.user?.isGM)
+    });
+
+    observeSecondaryAoeActivityHook(activity, "dnd5e.postUseActivity", {
+      usageConfigSubsequentActions: usageConfig?.subsequentActions ?? null,
+      resultSummary: summarizeWorkflowResult(results)
+    });
+  });
+
+  logInfo("Remote Action AOE activity observers registered.", {
+    currentUserId: game.user?.id ?? null,
+    currentUserName: game.user?.name ?? null,
+    isGM: Boolean(game.user?.isGM),
+    registeredHooks: [
+      "dnd5e.preUseActivity",
+      "dnd5e.postUseActivity"
+    ]
+  });
+}
+
 export function registerSpellWorkflowComparisonHooks() {
   if (!game.user?.isGM) {
     logDebug("Remote Action local GM spell workflow comparison hooks skipped on non-GM client.", {
@@ -2090,9 +3093,40 @@ export function registerSpellWorkflowComparisonHooks() {
     });
   });
 
+  Hooks.on("midi-qol.AttackRollComplete", (workflow) => {
+    logInfo("Remote Action AOE hook callback entered.", buildAoeHookEntryLogData(workflow, "midi-qol.AttackRollComplete"));
+    observeAoeHookWorkflow(workflow, "midi-qol.AttackRollComplete");
+  });
+
   Hooks.on("midi-qol.RollComplete", (workflow) => {
+    logInfo("Remote Action AOE hook callback entered.", buildAoeHookEntryLogData(workflow, "midi-qol.RollComplete"));
     const activityUuid = workflow?.activity?.uuid ?? null;
     if (!activityUuid) return;
+    observeAoeHookWorkflow(workflow, "midi-qol.RollComplete");
+
+
+    const executionMetadata = getRemoteActionExecutionMetadata(workflow);
+    if (executionMetadata.remoteActionExecution) {
+      logDebug("Remote Action AOE diagnostic at midi-qol.RollComplete.", {
+        ...buildAoeDiagnosticLogData({
+          item: workflow?.item ?? null,
+          launchedActivity: workflow?.activity ?? null,
+          workflow,
+          stage: "midi-qol.RollComplete",
+          nativeExecutionPath: executionMetadata.remoteActionExecutionMode?.includes(":activity.use")
+            ? "activity.use"
+            : executionMetadata.remoteActionExecutionMode?.includes("item.use")
+              ? "item.use"
+              : null,
+          workflowMode: executionMetadata.remoteActionExecutionMode ?? null,
+          executionMode: executionMetadata.remoteActionExecutionMode ?? null
+        }),
+        remoteActionExecution: executionMetadata.remoteActionExecution,
+        remoteActionExecutionMode: executionMetadata.remoteActionExecutionMode,
+        remoteActionItemCardUuid: executionMetadata.itemCardUuid,
+        workflowSummary: summarizeMidiWorkflow(workflow)
+      });
+    }
 
     const existingMonitor = LOCAL_GM_SPELL_WORKFLOW_MONITORS.get(activityUuid);
     if (!existingMonitor) return;
@@ -2128,6 +3162,16 @@ export function registerSpellWorkflowComparisonHooks() {
     }, 500);
   });
 
+  logInfo("Remote Action AOE hook observers registered.", {
+    currentUserId: game.user?.id ?? null,
+    currentUserName: game.user?.name ?? null,
+    isGM: Boolean(game.user?.isGM),
+    registeredHooks: [
+      "midi-qol.AttackRollComplete",
+      "midi-qol.RollComplete"
+    ]
+  });
+
   logDebug("Remote Action local GM spell workflow comparison hooks registered.", {
     currentUserId: game.user?.id ?? null,
     currentUserName: game.user?.name ?? null,
@@ -2137,6 +3181,266 @@ export function registerSpellWorkflowComparisonHooks() {
   });
 }
 
+async function startMidiAutoHitActivityWorkflow(item, activity, participants, options = {}) {
+  const {
+    workflowMode = MANUAL_HIT_WORKFLOW_MODE,
+    workflowSettings = getWorkflowSettings(),
+    midiApi = getMidiQolApi()
+  } = options;
+  participants = normalizeWorkflowParticipants(participants);
+
+  const activitySummary = getActivitySummary(activity, {});
+  const completeActivityUse = midiApi?.completeActivityUse;
+  const autoHitWorkflowClass = getRemoteActionAutoHitWorkflowClass(midiApi);
+  const targetTokenUuids = participants.targets
+    .map((token) => token?.document?.uuid ?? token?.uuid ?? null)
+    .filter(Boolean);
+
+  if (activity?.target?.affects?.type !== "self" && targetTokenUuids.length === 0) {
+    return {
+      ok: false,
+      reason: "missing-targets",
+      launchMode: "unavailable",
+      workflowMode,
+      attemptedMethod: "MidiQOL.completeActivityUse",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      ...activitySummary,
+      errors: ["At least one target token must be targeted for this remote Midi auto-hit workflow."]
+    };
+  }
+
+  if (typeof completeActivityUse !== "function" || typeof autoHitWorkflowClass !== "function") {
+    return {
+      ok: false,
+      reason: "midi-auto-hit-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode,
+      attemptedMethod: "MidiQOL.completeActivityUse",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      ...activitySummary,
+      errors: ["The Midi-QOL completeActivityUse API or remote auto-hit workflow class is not available for this item."]
+    };
+  }
+
+  const beforeIds = new Set(Object.keys(ui?.windows ?? {}));
+  const beforeMessageIds = new Set(Array.from(game.messages ?? []).map((message) => String(message.id)));
+  const baseUsage = {
+    legacy: false,
+    midiOptions: {
+      targetUuids: targetTokenUuids,
+      ignoreUserTargets: true,
+      checkGMstatus: false,
+      autoRollAttack: true,
+      fastForwardAttack: true,
+      autoRollDamage: workflowSettings.useDamageRolls ? "onHit" : "none",
+      fastForwardDamage: Boolean(workflowSettings.useDamageRolls),
+      workflowOptions: {
+        autoRollAttack: true,
+        fastForwardAttack: true,
+        autoRollDamage: workflowSettings.useDamageRolls ? "onHit" : "none",
+        fastForwardDamage: Boolean(workflowSettings.useDamageRolls),
+        targetConfirmation: "none",
+        attackRollDSN: false
+      }
+    }
+  };
+  const remoteExecutionConfigs = buildRemoteActionExecutionConfigs(
+    baseUsage,
+    { configure: false },
+    { create: true },
+    { executionMode: workflowMode }
+  );
+  remoteExecutionConfigs.usagePayload.midi ??= {};
+  remoteExecutionConfigs.usagePayload.midi.workflowClass = autoHitWorkflowClass;
+
+  logDebug("Preparing Midi-QOL complete auto-hit workflow.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? null,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    attemptedMethod: "MidiQOL.completeActivityUse",
+    workflowMode,
+    workflowSettings,
+    midiAvailable: Boolean(midiApi),
+    midiUsed: true,
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    targetTokenUuids
+  });
+
+  let workflow;
+  try {
+    workflow = await completeActivityUse(
+      activity?.uuid ?? activity,
+      remoteExecutionConfigs.usagePayload,
+      remoteExecutionConfigs.dialogConfig,
+      remoteExecutionConfigs.messageConfig
+    );
+  } catch (error) {
+    logWarning("Failed to start Midi-QOL complete auto-hit workflow.", {
+      itemUuid: item.uuid,
+      itemName: item.name,
+      activityUuid: activity?.uuid ?? null,
+      activityName: activitySummary.activityName,
+      activityType: activitySummary.activityType,
+      attemptedMethod: "MidiQOL.completeActivityUse",
+      workflowMode,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      error: error?.message ?? String(error)
+    });
+
+    return {
+      ok: false,
+      reason: "midi-auto-hit-workflow-failed",
+      launchMode: "unavailable",
+      workflowMode,
+      attemptedMethod: "MidiQOL.completeActivityUse",
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: false,
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      ...activitySummary,
+      errors: [error?.message ?? "Midi-QOL complete auto-hit workflow failed to start for this item."]
+    };
+  }
+
+  await waitForWorkflowUi();
+
+  const dialogApp = getNewUiWindows(beforeIds)[0] ?? null;
+  const dialogVisible = Boolean(dialogApp?.rendered);
+  const workflowMessage = workflow?.itemCardUuid ? fromUuidSync(workflow.itemCardUuid) : null;
+  const chatMessage = workflowMessage ?? getNewChatMessages(beforeMessageIds)[0] ?? null;
+  const chatCardCreated = Boolean(chatMessage);
+  const chatFocusActions = chatMessage
+    ? focusChatPanel(chatMessage, {
+        itemUuid: item.uuid,
+        itemName: item.name,
+        activityName: activitySummary.activityName,
+        activityType: activitySummary.activityType,
+        attemptedMethod: "MidiQOL.completeActivityUse",
+        workflowMode
+      })
+    : [];
+  const workflowSummary = summarizeMidiWorkflow(workflow);
+  const resultSummary = summarizeWorkflowResult(workflow);
+
+  logDebug("Midi-QOL complete auto-hit workflow resolved.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? null,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    attemptedMethod: "MidiQOL.completeActivityUse",
+    workflowMode,
+    midiAvailable: Boolean(midiApi),
+    midiUsed: true,
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    dialogVisible,
+    chatMessageId: chatMessage?.id ?? null,
+    chatCardCreated,
+    chatFocusActions,
+    workflowSummary,
+    resultSummary
+  });
+
+  logAoeApiSnapshotAfterPrimaryWorkflow({
+    item,
+    activity,
+    workflow,
+    resultSummary,
+    attemptedMethod: "MidiQOL.completeActivityUse",
+    workflowMode,
+    hookSource: "midi-auto-hit-complete-activity-use"
+  });
+
+  logInfo("Remote Action Midi auto-hit complete activity workflow started.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? null,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    attemptedMethod: "MidiQOL.completeActivityUse",
+    workflowMode,
+    midiAvailable: Boolean(midiApi),
+    midiUsed: true,
+    dialogVisible,
+    chatMessageId: chatMessage?.id ?? null,
+    workflowId: workflow?.id ?? null,
+    workflowItemCardUuid: workflow?.itemCardUuid ?? null,
+    hitTargetCount: workflow?.hitTargets?.size ?? 0,
+    targetCount: workflow?.targets?.size ?? participants.targets.length,
+    damageRollCount: Array.isArray(workflow?.damageRolls)
+      ? workflow.damageRolls.length
+      : (workflow?.damageRoll ? 1 : 0)
+  });
+
+  return {
+    ok: true,
+    attemptedMethod: "MidiQOL.completeActivityUse",
+    workflowMode,
+    launchMode: "direct-workflow",
+    midiAvailable: Boolean(midiApi),
+    midiUsed: true,
+    damageRolled: Boolean(workflow?.damageRoll || (Array.isArray(workflow?.damageRolls) && workflow.damageRolls.length > 0)),
+    isCritical: Boolean(workflow?.isCritical),
+    dialogApp,
+    dialogVisible,
+    chatMessageId: chatMessage?.id ?? null,
+    chatCardCreated,
+    chatFocusActions,
+    workflowId: workflow?.id ?? null,
+    workflowItemCardUuid: workflow?.itemCardUuid ?? null,
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    templatePlaced: Boolean(workflow?.templateUuid),
+    templateUuid: workflow?.templateUuid ?? null,
+    saveWorkflowStarted: (workflow?.saves?.size ?? 0) > 0 || (workflow?.failedSaves?.size ?? 0) > 0,
+    damageWorkflowStarted: Array.isArray(workflow?.damageRolls)
+      ? workflow.damageRolls.length > 0
+      : Boolean(workflow?.damageRoll),
+    finalResult: workflowSummary,
+    requiresDialog: false,
+    ...activitySummary
+  };
+}
 async function startDnd5eDamageOnlyWorkflow(item, activity, participants, options = {}) {
   const {
     workflowMode = MANUAL_HIT_WORKFLOW_MODE,
@@ -2504,6 +3808,268 @@ async function startDnd5eDamageOnlyWorkflow(item, activity, participants, option
   };
 }
 
+async function startExplicitActivityUseWorkflow(item, activity, participants, bridgePayload = {}, options = {}) {
+  participants = normalizeWorkflowParticipants(participants);
+  const workflowSettings = options?.workflowSettings ?? getWorkflowSettings();
+  const midiApi = options?.midiApi ?? getMidiQolApi();
+  const workflowClassification = options?.workflowClassification
+    ?? classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+  const {
+    usagePayload,
+    dialogConfig,
+    messageConfig,
+    aoeSecondaryExecution,
+    bridgeModuleId
+    } = buildExplicitActivityExecutionConfig(bridgePayload);
+  const activitySummary = getActivitySummary(activity, usagePayload);
+
+  if (workflowClassification.strategy === "midi-auto-hit") {
+    logDebug("Explicit remote activity workflow routed to Midi auto-hit workflow branch.", {
+      itemUuid: item?.uuid ?? null,
+      itemName: item?.name ?? null,
+      activityUuid: activity?.uuid ?? bridgePayload?.activityUuid ?? null,
+      activityName: activitySummary.activityName,
+      activityType: activitySummary.activityType,
+      workflowMode: MANUAL_HIT_WORKFLOW_MODE,
+      actionFamily: workflowClassification.actionFamily,
+      strategy: workflowClassification.strategy,
+      aoeSecondaryExecution,
+      bridgeModuleId
+    });
+
+    const routedWorkflowResult = await routeRemoteActivityWorkflow(item, activity, participants, {
+      workflowSettings,
+      midiApi,
+      classification: workflowClassification
+    });
+
+    if (routedWorkflowResult) {
+      return {
+        ...routedWorkflowResult,
+        actionFamily: workflowClassification.actionFamily,
+        strategy: workflowClassification.strategy,
+        requiresDialog: false,
+        aoeSecondaryExecution,
+        bridgeModuleId
+      };
+    }
+  }
+
+  logDebug("Prepared remoteActionExecution marker for explicit remote activity workflow.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? bridgePayload?.activityUuid ?? null,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    executionMode: "relay-activity-use",
+    aoeSecondaryExecution,
+    bridgeModuleId
+  });
+
+  if (typeof activity?.use !== "function") {
+    return {
+      ok: false,
+      reason: "usage-workflow-unavailable",
+      launchMode: "unavailable",
+      workflowMode: "explicit-activity-use",
+      attemptedMethod: "activity.use",
+      attemptedMethods: [],
+      dialogApp: null,
+      dialogVisible: false,
+      chatMessageId: null,
+      chatCardCreated: false,
+      chatFocusActions: [],
+      midiAvailable: Boolean(midiApi),
+      midiUsed: Boolean(midiApi),
+      sourceActor: serializeActor(participants.sourceActor),
+      sourceToken: serializeToken(participants.sourceToken),
+      sourceResolution: participants.sourceResolution,
+      targets: participants.targets.map(serializeToken),
+      actionFamily: workflowClassification.actionFamily,
+      strategy: "explicit-activity-use",
+      aoeSecondaryExecution,
+      bridgeModuleId,
+      ...activitySummary,
+      errors: ["The dnd5e activity.use API is not available for this explicit remote activity workflow."]
+    };
+  }
+
+  const beforeIds = new Set(Object.keys(ui?.windows ?? {}));
+  const beforeMessageIds = new Set(Array.from(game.messages ?? []).map((message) => String(message.id)));
+  const attemptedMethods = [];
+  let attemptedMethod = "activity.use(explicit-payload)";
+  let workflowResult = null;
+
+  logDebug("Remote Action AOE diagnostic before explicit activity.use workflow.", buildAoeDiagnosticLogData({
+    item,
+    launchedActivity: activity,
+    stage: "before-launch",
+    actionType: "relay-activity-use",
+    relayEntryPoint: "relay-activity-use",
+    nativeExecutionPath: "activity.use",
+    attemptedMethod,
+    workflowMode: "explicit-activity-use",
+    executionMode: "relay-activity-use"
+  }));
+
+  try {
+    attemptedMethods.push(attemptedMethod);
+    const workflowPromise = activity.use(usagePayload, dialogConfig, messageConfig);
+    if (!isThenable(workflowPromise)) {
+      throw new Error("The dnd5e activity.use API did not return a promise for the explicit remote activity workflow.");
+    }
+
+    workflowResult = await workflowPromise;
+  } catch (firstError) {
+    const targetIds = participants.targets.map((token) => token?.id).filter(Boolean);
+    if (targetIds.length === 0) {
+      return {
+        ok: false,
+        reason: "activity-use-failed",
+        launchMode: "unavailable",
+        workflowMode: "explicit-activity-use",
+        attemptedMethod,
+        attemptedMethods,
+        dialogApp: null,
+        dialogVisible: false,
+        chatMessageId: null,
+        chatCardCreated: false,
+        chatFocusActions: [],
+        midiAvailable: Boolean(midiApi),
+        midiUsed: Boolean(midiApi),
+        sourceActor: serializeActor(participants.sourceActor),
+        sourceToken: serializeToken(participants.sourceToken),
+        sourceResolution: participants.sourceResolution,
+        targets: participants.targets.map(serializeToken),
+        actionFamily: workflowClassification.actionFamily,
+        strategy: "explicit-activity-use",
+        aoeSecondaryExecution,
+        bridgeModuleId,
+        ...activitySummary,
+        errors: [firstError?.message ?? String(firstError)]
+      };
+    }
+
+    const savedTargetIds = getCurrentUserTargetIds();
+    const fallbackUsagePayload = foundry.utils.deepClone(usagePayload);
+    foundry.utils.setProperty(fallbackUsagePayload, "midiOptions.ignoreUserTargets", false);
+    attemptedMethod = "activity.use(explicit-payload-user-targets-fallback)";
+
+    try {
+      applyUserTargetIds(targetIds);
+      attemptedMethods.push(attemptedMethod);
+      const fallbackPromise = activity.use(fallbackUsagePayload, dialogConfig, messageConfig);
+      if (!isThenable(fallbackPromise)) {
+        throw new Error("The dnd5e activity.use API did not return a promise for the explicit remote activity workflow fallback.");
+      }
+
+      workflowResult = await fallbackPromise;
+    } catch (secondError) {
+      return {
+        ok: false,
+        reason: "activity-use-failed",
+        launchMode: "unavailable",
+        workflowMode: "explicit-activity-use",
+        attemptedMethod,
+        attemptedMethods,
+        dialogApp: null,
+        dialogVisible: false,
+        chatMessageId: null,
+        chatCardCreated: false,
+        chatFocusActions: [],
+        midiAvailable: Boolean(midiApi),
+        midiUsed: Boolean(midiApi),
+        sourceActor: serializeActor(participants.sourceActor),
+        sourceToken: serializeToken(participants.sourceToken),
+        sourceResolution: participants.sourceResolution,
+        targets: participants.targets.map(serializeToken),
+        actionFamily: workflowClassification.actionFamily,
+        strategy: "explicit-activity-use",
+        aoeSecondaryExecution,
+        bridgeModuleId,
+        ...activitySummary,
+        errors: [firstError?.message ?? String(firstError), secondError?.message ?? String(secondError)]
+      };
+    } finally {
+      applyUserTargetIds(savedTargetIds);
+    }
+  }
+
+  await waitForWorkflowUi();
+
+  const dialogApp = getNewUiWindows(beforeIds)[0] ?? null;
+  const dialogVisible = Boolean(dialogApp?.rendered);
+  const chatMessage = getNewChatMessages(beforeMessageIds)[0] ?? null;
+  const chatCardCreated = Boolean(chatMessage);
+  const chatFocusActions = chatMessage
+    ? focusChatPanel(chatMessage, {
+        itemUuid: item.uuid,
+        itemName: item.name,
+        activityName: activitySummary.activityName,
+        activityType: activitySummary.activityType,
+        attemptedMethod,
+        workflowMode: "explicit-activity-use",
+        aoeSecondaryExecution,
+        bridgeModuleId
+      })
+    : [];
+
+  logDebug("Explicit remote activity workflow started.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? null,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    attemptedMethod,
+    attemptedMethods,
+    workflowMode: "explicit-activity-use",
+    launchMode: dialogVisible ? "dialog" : "direct-workflow",
+    midiAvailable: Boolean(midiApi),
+    midiUsed: Boolean(midiApi),
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    actionFamily: workflowClassification.actionFamily,
+    strategy: "explicit-activity-use",
+    requiresDialog: activitySummary.requiresDialog,
+    aoeSecondaryExecution,
+    bridgeModuleId,
+    usagePayload,
+    dialogConfig,
+    messageConfig,
+    dialogAppId: dialogApp?.appId ?? null,
+    dialogVisible,
+    chatMessageId: chatMessage?.id ?? null,
+    chatCardCreated,
+    chatFocusActions,
+    workflowResult: summarizeWorkflowResult(workflowResult)
+  });
+
+  return {
+    ok: true,
+    attemptedMethod,
+    attemptedMethods,
+    dialogApp,
+    dialogVisible,
+    chatMessageId: chatMessage?.id ?? null,
+    chatCardCreated,
+    chatFocusActions,
+    launchMode: dialogVisible ? "dialog" : "direct-workflow",
+    workflowMode: "explicit-activity-use",
+    midiAvailable: Boolean(midiApi),
+    midiUsed: Boolean(midiApi),
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    actionFamily: workflowClassification.actionFamily,
+    strategy: "explicit-activity-use",
+    aoeSecondaryExecution,
+    bridgeModuleId,
+    ...activitySummary
+  };
+}
 async function startDnd5eItemUsageWorkflow(item) {
   if (!item) {
     return {
@@ -2598,88 +4164,44 @@ async function startDnd5eItemUsageWorkflow(item) {
     };
   }
 
-  if (shouldUseManualHitDamageWorkflow(item, activity, workflowSettings)) {
-    logDebug("Switching to target-driven damage workflow based on workflow settings.", {
+  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+
+  logDebug("Remote activity workflow classified.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? null,
+    activityName: activity?.name ?? null,
+    activityType: activity?.type ?? activity?.metadata?.type ?? null,
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    workflowClassification
+  });
+
+  const routedWorkflowResult = await routeRemoteActivityWorkflow(item, activity, participants, {
+    workflowSettings,
+    midiApi,
+    classification: workflowClassification
+  });
+
+  if (routedWorkflowResult) {
+    logDebug("Remote activity workflow route selected.", {
       itemUuid: item.uuid,
       itemName: item.name,
-      workflowSettings,
-      workflowMode: MANUAL_HIT_WORKFLOW_MODE,
-      midiAvailable,
+      activityUuid: activity?.uuid ?? null,
+      activityName: activity?.name ?? null,
+      activityType: activity?.type ?? activity?.metadata?.type ?? null,
       sourceActor: serializeActor(participants.sourceActor),
       sourceToken: serializeToken(participants.sourceToken),
       sourceResolution: participants.sourceResolution,
       targets: participants.targets.map(serializeToken),
-      activityId: activity.id,
-      activityName: activity.name,
-      activityType: activity.type ?? activity.metadata?.type ?? null
+      workflowClassification,
+      selectedStrategy: workflowClassification.strategy
     });
 
-    return startDnd5eDamageOnlyWorkflow(item, activity, participants, {
-      workflowMode: MANUAL_HIT_WORKFLOW_MODE,
-      midiApi
-    });
+    return { ...routedWorkflowResult, actionFamily: workflowClassification.actionFamily, strategy: workflowClassification.strategy };
   }
-
-  const spellWorkflowProbe = getSpellWorkflowBranchProbe(item, activity, midiApi);
-  const shouldTraceSpellWorkflow = spellWorkflowProbe.isSpellItem
-    || spellWorkflowProbe.hasTemplate
-    || spellWorkflowProbe.isSaveActivity;
-
-  if (shouldTraceSpellWorkflow) {
-    logDebug("Remote spell workflow branch probe.", {
-      itemUuid: item.uuid,
-      itemName: item.name,
-      activityUuid: activity?.uuid ?? null,
-      activityName: activity?.name ?? null,
-      activityType: activity?.type ?? activity?.metadata?.type ?? null,
-      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
-      attemptedMethod: "item.use",
-      sourceActor: serializeActor(participants.sourceActor),
-      sourceToken: serializeToken(participants.sourceToken),
-      targets: participants.targets.map(serializeToken),
-      spellWorkflowProbe
-    });
-  }
-
-  if (spellWorkflowProbe.shouldUseMidiSpellWorkflow) {
-    logDebug("Remote spell workflow branch selected.", {
-      itemUuid: item.uuid,
-      itemName: item.name,
-      activityUuid: activity?.uuid ?? null,
-      activityName: activity?.name ?? null,
-      activityType: activity?.type ?? activity?.metadata?.type ?? null,
-      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
-      attemptedMethod: "item.use",
-      midiAvailable: Boolean(midiApi),
-      sourceActor: serializeActor(participants.sourceActor),
-      sourceToken: serializeToken(participants.sourceToken),
-      targets: participants.targets.map(serializeToken),
-      spellWorkflowProbe
-    });
-
-    return startMidiCompleteActivityWorkflow(item, activity, participants, {
-      workflowSettings,
-      midiApi
-    });
-  }
-
-  if (shouldTraceSpellWorkflow) {
-    logDebug("Remote spell workflow branch NOT selected.", {
-      itemUuid: item.uuid,
-      itemName: item.name,
-      activityUuid: activity?.uuid ?? null,
-      activityName: activity?.name ?? null,
-      activityType: activity?.type ?? activity?.metadata?.type ?? null,
-      workflowMode: MIDI_SPELL_WORKFLOW_MODE,
-      attemptedMethod: "item.use",
-      midiAvailable: Boolean(midiApi),
-      sourceActor: serializeActor(participants.sourceActor),
-      sourceToken: serializeToken(participants.sourceToken),
-      targets: participants.targets.map(serializeToken),
-      spellWorkflowProbe
-    });
-  }
-
 
   if (typeof activity._prepareUsageConfig !== "function") {
     return {
@@ -2718,6 +4240,8 @@ async function startDnd5eItemUsageWorkflow(item) {
     : workflowSettings.useAttackRolls
       ? "native-foundry"
       : "custom-workflow-profile";
+  const useItemDialogWorkflow = launchMode === "dialog" && typeof item?.use === "function";
+  const attemptedMethod = useItemDialogWorkflow ? "item.use" : "activity.use";
 
   if (nativeAttackModeExperimental) {
     logDebug("Using native Foundry attack workflow for a weapon activity. This mode remains experimental until stabilized.", {
@@ -2738,7 +4262,7 @@ async function startDnd5eItemUsageWorkflow(item) {
     itemName: item.name,
     activityName: activitySummary.activityName,
     activityType: activitySummary.activityType,
-    attemptedMethod: "activity.use",
+    attemptedMethod,
     workflowMode: "native-foundry",
     workflowSettings,
     midiAvailable,
@@ -2747,17 +4271,20 @@ async function startDnd5eItemUsageWorkflow(item) {
     sourceResolution: participants.sourceResolution,
     targets: participants.targets.map(serializeToken),
     launchMode,
+    actionFamily: workflowClassification.actionFamily,
+    strategy: workflowClassification.strategy,
+    requiresDialog: activitySummary.requiresDialog,
     usageConfig,
     hasActivityUse: typeof activity.use === "function"
   });
 
-  if (typeof activity.use !== "function") {
+  if (!useItemDialogWorkflow && typeof activity.use !== "function") {
     return {
       ok: false,
       reason: "usage-workflow-unavailable",
       launchMode: "unavailable",
       workflowMode: "native-foundry",
-      attemptedMethod: "activity.use",
+      attemptedMethod,
       dialogApp: null,
       dialogVisible: false,
       chatMessageId: null,
@@ -2776,7 +4303,54 @@ async function startDnd5eItemUsageWorkflow(item) {
 
   const beforeIds = new Set(Object.keys(ui?.windows ?? {}));
   const beforeMessageIds = new Set(Array.from(game.messages ?? []).map((message) => String(message.id)));
-  const workflowPromise = activity.use({}, { configure: true }, { create: true });
+  const remoteExecutionConfigs = buildRemoteActionExecutionConfigs(
+    useItemDialogWorkflow ? { legacy: false } : {},
+    { configure: true },
+    { create: true },
+    {
+      executionMode: useItemDialogWorkflow
+        ? "open-item-use-dialog:item.use"
+        : "open-item-use-dialog:activity.use"
+    }
+  );
+
+  logDebug("Prepared remoteActionExecution marker for native dnd5e item workflow on receiver.", {
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityName: activitySummary.activityName,
+    activityType: activitySummary.activityType,
+    attemptedMethod,
+    workflowMode: "native-foundry",
+    executionMode: useItemDialogWorkflow
+      ? "open-item-use-dialog:item.use"
+      : "open-item-use-dialog:activity.use"
+  });
+
+  logDebug("Remote Action AOE diagnostic before native open-item-use-dialog workflow.", buildAoeDiagnosticLogData({
+    item,
+    launchedActivity: activity,
+    stage: "before-launch",
+    actionType: "open-item-use-dialog",
+    relayEntryPoint: "open-item-use-dialog",
+    nativeExecutionPath: attemptedMethod,
+    attemptedMethod,
+    workflowMode: "native-foundry",
+    executionMode: useItemDialogWorkflow
+      ? "open-item-use-dialog:item.use"
+      : "open-item-use-dialog:activity.use"
+  }));
+
+  const workflowPromise = useItemDialogWorkflow
+    ? item.use(
+      remoteExecutionConfigs.usagePayload,
+      remoteExecutionConfigs.dialogConfig,
+      remoteExecutionConfigs.messageConfig
+    )
+    : activity.use(
+      remoteExecutionConfigs.usagePayload,
+      remoteExecutionConfigs.dialogConfig,
+      remoteExecutionConfigs.messageConfig
+    );
 
   if (!isThenable(workflowPromise)) {
     return {
@@ -2784,7 +4358,7 @@ async function startDnd5eItemUsageWorkflow(item) {
       reason: "usage-workflow-unavailable",
       launchMode: "unavailable",
       workflowMode: "native-foundry",
-      attemptedMethod: "activity.use",
+      attemptedMethod,
       dialogApp: null,
       dialogVisible: false,
       chatMessageId: null,
@@ -2797,7 +4371,7 @@ async function startDnd5eItemUsageWorkflow(item) {
       sourceResolution: participants.sourceResolution,
       targets: participants.targets.map(serializeToken),
       ...activitySummary,
-      errors: ["The dnd5e activity.use API did not return a promise for this item."]
+      errors: [`The dnd5e ${attemptedMethod} API did not return a promise for this item.`]
     };
   }
 
@@ -2811,7 +4385,7 @@ async function startDnd5eItemUsageWorkflow(item) {
           itemName: item.name,
           activityName: activitySummary.activityName,
           activityType: activitySummary.activityType,
-          attemptedMethod: "activity.use",
+          attemptedMethod,
           workflowMode: "native-foundry",
           launchMode
         })
@@ -2822,7 +4396,7 @@ async function startDnd5eItemUsageWorkflow(item) {
       itemName: item.name,
       activityName: activitySummary.activityName,
       activityType: activitySummary.activityType,
-      attemptedMethod: "activity.use",
+      attemptedMethod,
       workflowMode: "native-foundry",
       launchMode,
       midiAvailable,
@@ -2831,11 +4405,23 @@ async function startDnd5eItemUsageWorkflow(item) {
       sourceToken: serializeToken(participants.sourceToken),
       sourceResolution: participants.sourceResolution,
       targets: participants.targets.map(serializeToken),
+      actionFamily: workflowClassification.actionFamily,
+      strategy: workflowClassification.strategy,
+      requiresDialog: activitySummary.requiresDialog,
       workflowResult: resultSummary,
       chatMessageId: resultMessage?.id ?? null,
       chatCardCreated,
       chatFocusActions,
       result
+    });
+    logAoeApiSnapshotAfterPrimaryWorkflow({
+      item,
+      activity,
+      workflow: getMidiWorkflowByActivityUuid(activity?.uuid) ?? null,
+      resultSummary,
+      attemptedMethod,
+      workflowMode: "native-foundry",
+      hookSource: "open-item-use-dialog"
     });
   }).catch((error) => {
     logDebug("dnd5e activity.use workflow rejected.", {
@@ -2843,7 +4429,7 @@ async function startDnd5eItemUsageWorkflow(item) {
       itemName: item.name,
       activityName: activitySummary.activityName,
       activityType: activitySummary.activityType,
-      attemptedMethod: "activity.use",
+      attemptedMethod,
       workflowMode: "native-foundry",
       launchMode,
       midiAvailable,
@@ -2868,7 +4454,7 @@ async function startDnd5eItemUsageWorkflow(item) {
         itemName: item.name,
         activityName: activitySummary.activityName,
         activityType: activitySummary.activityType,
-        attemptedMethod: "activity.use",
+        attemptedMethod,
         workflowMode: "native-foundry",
         launchMode
       })
@@ -2879,7 +4465,7 @@ async function startDnd5eItemUsageWorkflow(item) {
     itemName: item.name,
     activityName: activitySummary.activityName,
     activityType: activitySummary.activityType,
-    attemptedMethod: "activity.use",
+    attemptedMethod,
     workflowMode: "native-foundry",
     workflowSettings,
     midiAvailable,
@@ -2894,17 +4480,20 @@ async function startDnd5eItemUsageWorkflow(item) {
     chatMessageId: chatMessage?.id ?? null,
     chatCardCreated,
     chatFocusActions,
+    actionFamily: workflowClassification.actionFamily,
+    strategy: workflowClassification.strategy,
+    requiresDialog: activitySummary.requiresDialog,
     directWorkflow: launchMode === "direct-workflow",
     expectsManualUseClick: true,
     workflowLinkedToExecution: true,
     expectedSubmitHandler: launchMode === "dialog"
-      ? "dnd5e ActivityUsageDialog form handler via activity.use"
-      : "dnd5e direct activity.use workflow without visible dialog"
+      ? `dnd5e ActivityUsageDialog form handler via ${attemptedMethod}`
+      : `dnd5e direct ${attemptedMethod} workflow without visible dialog`
   });
 
   return {
     ok: true,
-    attemptedMethod: "activity.use",
+    attemptedMethod,
     dialogApp,
     dialogVisible,
     chatMessageId: chatMessage?.id ?? null,
@@ -2919,6 +4508,8 @@ async function startDnd5eItemUsageWorkflow(item) {
     sourceResolution: participants.sourceResolution,
     targets: participants.targets.map(serializeToken),
     ...activitySummary,
+    actionFamily: workflowClassification.actionFamily,
+    strategy: workflowClassification.strategy,
     usageConfig
   };
 }
@@ -3094,6 +4685,151 @@ async function handleOpenItemSheetAction(request) {
   });
 }
 
+async function handleRelayActivityUseAction(request) {
+  const actionType = "relay-activity-use";
+  const validation = validateRelayActivityUseRequest(request);
+
+  if (!validation.ok) {
+    logDebug("relay-activity-use payload validation failed.", {
+      actionType,
+      errors: validation.errors,
+      request
+    });
+    return buildInvalidActionResponse(request, validation.errors);
+  }
+
+  const payload = validation.normalizedPayload;
+  const item = await resolveUuidDocumentSafely(payload.itemUuid);
+
+  if (!item) {
+    return buildDocumentErrorResponse(request, "document-not-found", [
+      `No document found for itemUuid '${payload.itemUuid}'.`
+    ]);
+  }
+
+  if (!(item instanceof Item)) {
+    return buildDocumentErrorResponse(request, "invalid-document-type", [
+      `UUID '${payload.itemUuid}' does not resolve to an Item.`
+    ]);
+  }
+
+  const activity = await resolveItemActivity(item, payload.activityUuid);
+  if (!activity) {
+    return buildDocumentErrorResponse(request, "activity-not-found", [
+      `No dnd5e activity found for activityUuid '${payload.activityUuid}' on item '${item.name}'.`
+    ]);
+  }
+
+  const participants = await resolveExplicitWorkflowParticipants(item, payload);
+  const workflowSettings = getWorkflowSettings();
+  const midiApi = getMidiQolApi();
+  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+
+  logDebug("Executing explicit remote activity bridge workflow.", {
+    actionType,
+    itemUuid: item.uuid,
+    itemName: item.name,
+    activityUuid: activity?.uuid ?? payload.activityUuid,
+    activityName: activity?.name ?? null,
+    activityType: activity?.type ?? activity?.metadata?.type ?? null,
+    sourceActor: serializeActor(participants.sourceActor),
+    sourceToken: serializeToken(participants.sourceToken),
+    sourceResolution: participants.sourceResolution,
+    targets: participants.targets.map(serializeToken),
+    actionFamily: workflowClassification.actionFamily,
+    strategy: "explicit-activity-use",
+    requiresDialog: workflowClassification.requiresDialog,
+    aoeSecondaryExecution: payload.aoeSecondaryExecution,
+    bridgeContext: payload.context ?? {}
+  });
+
+  const workflowResult = await startExplicitActivityUseWorkflow(item, activity, participants, payload, {
+    workflowClassification,
+    workflowSettings,
+    midiApi
+  });
+
+  if (!workflowResult.ok) {
+    logWarning("Explicit remote activity bridge workflow failed.", {
+      actionType,
+      itemUuid: item.uuid,
+      itemName: item.name,
+      activityUuid: activity?.uuid ?? payload.activityUuid,
+      activityName: activity?.name ?? null,
+      activityType: activity?.type ?? activity?.metadata?.type ?? null,
+      attemptedMethod: workflowResult.attemptedMethod,
+      attemptedMethods: workflowResult.attemptedMethods ?? [],
+      sourceActor: workflowResult.sourceActor,
+      sourceToken: workflowResult.sourceToken,
+      targets: workflowResult.targets,
+      actionFamily: workflowResult.actionFamily ?? workflowClassification.actionFamily,
+      strategy: workflowResult.strategy ?? "explicit-activity-use",
+      aoeSecondaryExecution: workflowResult.aoeSecondaryExecution ?? payload.aoeSecondaryExecution,
+      reason: workflowResult.reason,
+      errors: workflowResult.errors
+    });
+
+    return {
+      ...buildDocumentErrorResponse(request, workflowResult.reason, workflowResult.errors),
+      itemName: item.name,
+      attemptedMethod: workflowResult.attemptedMethod,
+      attemptedMethods: workflowResult.attemptedMethods ?? [],
+      workflowMode: workflowResult.workflowMode,
+      launchMode: workflowResult.launchMode,
+      activityId: workflowResult.activityId ?? activity?.id ?? null,
+      activityName: workflowResult.activityName ?? activity?.name ?? null,
+      activityType: workflowResult.activityType ?? activity?.type ?? activity?.metadata?.type ?? null,
+      actionFamily: workflowResult.actionFamily ?? workflowClassification.actionFamily,
+      strategy: workflowResult.strategy ?? "explicit-activity-use",
+      requiresDialog: workflowResult.requiresDialog,
+      dialogVisible: workflowResult.dialogVisible,
+      midiAvailable: workflowResult.midiAvailable ?? false,
+      midiUsed: workflowResult.midiUsed ?? false,
+      sourceActor: workflowResult.sourceActor ?? null,
+      sourceToken: workflowResult.sourceToken ?? null,
+      sourceResolution: workflowResult.sourceResolution ?? null,
+      targets: workflowResult.targets ?? [],
+      chatMessageId: workflowResult.chatMessageId ?? null,
+      chatCardCreated: workflowResult.chatCardCreated ?? false,
+      aoeSecondaryExecution: workflowResult.aoeSecondaryExecution ?? payload.aoeSecondaryExecution
+    };
+  }
+
+  return buildBaseResponse(request, {
+    handled: true,
+    message: "Remote Action executed an explicit activity bridge workflow on the receiver.",
+    item: {
+      uuid: item.uuid,
+      id: item.id,
+      name: item.name
+    },
+    itemName: item.name,
+    attemptedMethod: workflowResult.attemptedMethod,
+    attemptedMethods: workflowResult.attemptedMethods ?? [],
+    workflowMode: workflowResult.workflowMode,
+    launchMode: workflowResult.launchMode,
+    activityId: workflowResult.activityId ?? activity?.id ?? null,
+    activityName: workflowResult.activityName ?? activity?.name ?? null,
+    activityType: workflowResult.activityType ?? activity?.type ?? activity?.metadata?.type ?? null,
+    actionFamily: workflowResult.actionFamily ?? workflowClassification.actionFamily,
+    strategy: workflowResult.strategy ?? "explicit-activity-use",
+    requiresDialog: workflowResult.requiresDialog,
+    dialogAppId: workflowResult.dialogApp?.appId ?? null,
+    dialogClass: workflowResult.dialogApp?.constructor?.name ?? null,
+    dialogVisible: workflowResult.dialogVisible,
+    dialogRendered: Boolean(workflowResult.dialogApp?.rendered),
+    midiAvailable: workflowResult.midiAvailable ?? false,
+    midiUsed: workflowResult.midiUsed ?? false,
+    sourceActor: workflowResult.sourceActor ?? null,
+    sourceToken: workflowResult.sourceToken ?? null,
+    sourceResolution: workflowResult.sourceResolution ?? null,
+    targets: workflowResult.targets ?? [],
+    chatMessageId: workflowResult.chatMessageId ?? null,
+    chatCardCreated: workflowResult.chatCardCreated ?? false,
+    chatFocusActions: workflowResult.chatFocusActions ?? [],
+    aoeSecondaryExecution: workflowResult.aoeSecondaryExecution ?? payload.aoeSecondaryExecution
+  });
+}
 async function handleOpenItemUseDialogAction(request) {
   const actionType = "open-item-use-dialog";
 
@@ -3149,6 +4885,8 @@ async function handleOpenItemUseDialogAction(request) {
       launchMode: workflowResult.launchMode,
       activityName: workflowResult.activityName,
       activityType: workflowResult.activityType,
+      actionFamily: workflowResult.actionFamily ?? null,
+      strategy: workflowResult.strategy ?? null,
       midiAvailable: workflowResult.midiAvailable,
       midiUsed: workflowResult.midiUsed,
       sourceActor: workflowResult.sourceActor,
@@ -3194,8 +4932,8 @@ async function handleOpenItemUseDialogAction(request) {
 
   const message = workflowResult.workflowMode === MANUAL_HIT_WORKFLOW_MODE
     ? workflowResult.midiUsed
-      ? "Remote Action started Midi-QOL damage workflow after a manual hit assumption."
-      : "Remote Action started Foundry damage workflow after a manual hit assumption."
+      ? "Remote Action started a Midi-QOL complete auto-hit workflow on the receiver."
+      : "Remote Action started an auto-hit workflow on the receiver."
     : workflowResult.launchMode === "dialog"
       ? "Remote Action opened item use dialog on receiver."
       : workflowResult.chatCardCreated
@@ -3219,6 +4957,8 @@ async function handleOpenItemUseDialogAction(request) {
     activityId: workflowResult.activityId,
     activityName: workflowResult.activityName,
     activityType: workflowResult.activityType,
+    actionFamily: workflowResult.actionFamily ?? null,
+    strategy: workflowResult.strategy ?? null,
     requiresDialog: workflowResult.requiresDialog,
     dialogAppId: workflowResult.dialogApp?.appId ?? null,
     dialogClass: workflowResult.dialogApp?.constructor?.name ?? null,
@@ -3291,6 +5031,8 @@ export async function executeRemoteAction(request = {}) {
       return handleOpenItemSheetAction(request);
     case "open-item-use-dialog":
       return handleOpenItemUseDialogAction(request);
+    case "relay-activity-use":
+      return handleRelayActivityUseAction(request);
     default:
       return handleUnknownAction(request);
   }

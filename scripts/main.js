@@ -1,11 +1,11 @@
 import { MODULE_ID, registerSettings } from "./settings.js";
 import { registerSocket } from "./socket.js";
 import { registerUiHooks } from "./ui-hooks.js";
-import { debugConfig, pingRelay, relayAction, sendAction } from "./relay.js";
+import { debugConfig, pingRelay, relayAction, relayActivityUse, sendAction } from "./relay.js";
 import { logDebug, logInfo, logWarning } from "./debug.js";
-import { registerSpellWorkflowComparisonHooks } from "./execute.js";
+import { registerSecondaryAoeActivityObservers, registerSpellWorkflowComparisonHooks } from "./execute.js";
 
-const REMOTE_ACTION_BUILD_FINGERPRINT = "2026-03-31-fireball-post-template-chain-01";
+const REMOTE_ACTION_BUILD_FINGERPRINT = "2026-03-31-activity-use-wrapper-aoe-compat-01";
 
 function logModuleFingerprint(stage) {
   const module = game.modules.get(MODULE_ID);
@@ -38,6 +38,7 @@ Hooks.once("init", () => {
       debugConfig,
       pingRelay,
       relayAction,
+      relayActivityUse,
       sendAction
     };
   }
@@ -53,8 +54,11 @@ Hooks.once("ready", () => {
     debugConfig,
     pingRelay,
     relayAction,
+    relayActivityUse,
     sendAction
   };
+
+  registerSecondaryAoeActivityObservers();
 
   if (game.user?.isGM) {
     registerSpellWorkflowComparisonHooks();
