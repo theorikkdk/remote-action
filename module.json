@@ -1,13 +1,17 @@
 {
   "id": "remote-action",
   "title": "Remote Action",
-  "description": "MVP skeleton for relaying remote actions in DnD5e through socketlib.",
-  "version": "0.1.0",
+  "description": "Relay authorized DnD5e item and activity uses to a primary receiver client for shared-table play.",
+  "version": "0.2.0",
   "authors": [
     {
-      "name": "Codex"
+      "name": "Theorikkdk"
     }
   ],
+  "url": "https://github.com/theorikkdk/remote-action",
+  "manifest": "https://github.com/theorikkdk/remote-action/releases/latest/download/module.json",
+  "download": "https://github.com/theorikkdk/remote-action/releases/download/v0.2.0/remote-action.zip",
+  "readme": "https://github.com/theorikkdk/remote-action/blob/main/README.md",
   "compatibility": {
     "minimum": "12",
     "verified": "13"
