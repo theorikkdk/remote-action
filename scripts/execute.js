@@ -1,8 +1,11 @@
 import { logDebug, logInfo, logWarning } from "./debug.js";
-import { MODULE_ID, getWorkflowSettings } from "./settings.js";
+import {
+  MODULE_ID,
+  getWorkflowSettings
+} from "./settings.js";
 
 const NOTIFICATION_LEVELS = new Set(["info", "warn", "error"]);
-const MANUAL_HIT_WORKFLOW_MODE = "midi-auto-hit-complete-activity-use";
+const AUTO_HIT_WORKFLOW_MODE = "midi-auto-hit-complete-activity-use";
 const MIDI_SPELL_WORKFLOW_MODE = "midi-spell-complete-activity-use";
 const REMOTE_SPELL_AUTO_ROLL_DAMAGE_MODE = "saveOnly";
 const LOCAL_GM_SPELL_WORKFLOW_MODE = "local-gm-native-spell-use";
@@ -1124,11 +1127,12 @@ function focusChatPanel(message, context = {}) {
   return actions;
 }
 
-function shouldUseManualHitDamageWorkflow(item, activity, workflowSettings) {
+function shouldUseAutoHitWorkflow(item, activity, workflowSettings) {
   const activityType = activity?.type ?? activity?.metadata?.type ?? null;
   const isAttackActivity = activityType === "attack";
 
-  return isAttackActivity && !Boolean(workflowSettings?.useAttackRolls);
+  if (!isAttackActivity) return false;
+  return !Boolean(workflowSettings?.useAttackRolls);
 }
 
 function getSpellWorkflowBranchProbe(item, activity, midiApi) {
@@ -1210,7 +1214,7 @@ function getActivityDamageKinds(activity) {
   return Array.from(types);
 }
 
-function classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi) {
+function classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi, context = {}) {
   const activityType = activity?.type ?? activity?.metadata?.type ?? null;
   const activitySummary = getActivitySummary(activity, {});
   const actionType = activity?.attack?.type ?? item?.system?.actionType ?? item?.system?.activation?.type ?? null;
@@ -1247,7 +1251,7 @@ function classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiAp
   }
 
   let strategy = "native-foundry";
-  if (shouldUseManualHitDamageWorkflow(item, activity, workflowSettings)) {
+  if (shouldUseAutoHitWorkflow(item, activity, workflowSettings)) {
     strategy = "midi-auto-hit";
   } else if (spellWorkflowProbe.shouldUseMidiSpellWorkflow) {
     strategy = "midi-spell";
@@ -1270,7 +1274,9 @@ function classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiAp
     isSpellAttack,
     damageKinds,
     requiresDialog: activitySummary.requiresDialog,
-    spellWorkflowProbe
+    spellWorkflowProbe,
+    rollModeActingUserId: context.actingUserId ?? null,
+    rollModeRequestScopeId: context.rollModeRequestScopeId ?? null
   };
 }
 
@@ -1278,13 +1284,16 @@ async function routeRemoteActivityWorkflow(item, activity, participants, options
   const {
     workflowSettings = getWorkflowSettings(),
     midiApi = getMidiQolApi(),
-    classification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi)
+    classification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi, {
+      actingUserId: options.actingUserId ?? null,
+      rollModeRequestScopeId: options.requestScopeId ?? null
+    })
   } = options;
 
   switch (classification.strategy) {
     case "midi-auto-hit":
       return startMidiAutoHitActivityWorkflow(item, activity, participants, {
-        workflowMode: MANUAL_HIT_WORKFLOW_MODE,
+        workflowMode: AUTO_HIT_WORKFLOW_MODE,
         workflowSettings,
         midiApi
       });
@@ -1834,8 +1843,8 @@ function createSpellWorkflowMonitor({
         })
       });
 
-      let resumeMethod = "native-activity-use-no-manual-resume";
-      let resumeMethodChosen = "native-activity-use-no-manual-resume";
+      let resumeMethod = "native-activity-use-no-resume";
+      let resumeMethodChosen = "native-activity-use-no-resume";
       let unSuspendCalled = false;
       let performStateCalled = false;
       let resumeResult = null;
@@ -1914,7 +1923,7 @@ function createSpellWorkflowMonitor({
         }
       } catch (error) {
         resumeMethod = `resume-error: ${error?.message ?? String(error)}`;
-        resumeMethodChosen = resumeMethodChosen === "native-activity-use-no-manual-resume"
+        resumeMethodChosen = resumeMethodChosen === "native-activity-use-no-resume"
           ? "resume-error"
           : `${resumeMethodChosen}-error`;
       }
@@ -3010,180 +3019,9 @@ export function registerSecondaryAoeActivityObservers() {
   });
 }
 
-export function registerSpellWorkflowComparisonHooks() {
-  if (!game.user?.isGM) {
-    logDebug("Remote Action local GM spell workflow comparison hooks skipped on non-GM client.", {
-      currentUserId: game.user?.id ?? null,
-      currentUserName: game.user?.name ?? null,
-      isGM: Boolean(game.user?.isGM),
-      monitorRegistrationPath: "ready-skip-non-gm",
-      note:
-        "Remote Action local GM comparison hooks are disabled on non-GM clients. External MidiItem initialization errors for non-dnd5e items are outside this comparison monitor."
-    });
-    logDebug("Remote Action external client noise isolated from spell workflow diagnosis.", {
-      currentUserId: game.user?.id ?? null,
-      currentUserName: game.user?.name ?? null,
-      isGM: Boolean(game.user?.isGM),
-      isolatedSignals: [
-        "MidiItem dnd5e-sheet-notes.note initialization error",
-        "TouchVTT client initialization failure"
-      ],
-      monitorRegistrationPath: "ready-skip-non-gm",
-      moduleEnvironment: getSpellWorkflowModuleEnvironment()
-    });
-    return;
-  }
-
-  if (spellWorkflowComparisonHooksRegistered) return;
-  spellWorkflowComparisonHooksRegistered = true;
-
-  Hooks.on("dnd5e.preUseActivity", (activity) => {
-    if (!game.user?.isGM) return;
-    if (!activity?.uuid) return;
-    if (isRemoteSpellActivity(activity.uuid)) return;
-
-    const item = activity?.item ?? activity?.parent ?? null;
-    if (!(item instanceof Item)) return;
-
-    const midiApi = getMidiQolApi();
-    const spellWorkflowProbe = getSpellWorkflowBranchProbe(item, activity, midiApi);
-    if (!spellWorkflowProbe.shouldUseMidiSpellWorkflow) return;
-
-    const existingMonitor = LOCAL_GM_SPELL_WORKFLOW_MONITORS.get(activity.uuid);
-    if (existingMonitor) {
-      clearTimeout(existingMonitor.timeoutId);
-      existingMonitor.monitor.cleanup();
-      LOCAL_GM_SPELL_WORKFLOW_MONITORS.delete(activity.uuid);
-    }
-
-    const participants = getWorkflowParticipants(item);
-    const monitor = createSpellWorkflowMonitor({
-      item,
-      activity,
-      participants,
-      attemptedMethod: "item.use",
-      workflowMode: LOCAL_GM_SPELL_WORKFLOW_MODE,
-      monitorSource: LOCAL_GM_SPELL_WORKFLOW_SOURCE
-    });
-
-    const timeoutId = setTimeout(() => {
-      monitor.cleanup();
-      LOCAL_GM_SPELL_WORKFLOW_MONITORS.delete(activity.uuid);
-    }, 30000);
-
-    LOCAL_GM_SPELL_WORKFLOW_MONITORS.set(activity.uuid, {
-      monitor,
-      timeoutId
-    });
-
-    logDebug("Local GM spell workflow comparison hook armed.", {
-      itemUuid: item.uuid,
-      itemName: item.name,
-      activityUuid: activity.uuid,
-      activityName: activity?.name ?? null,
-      activityType: activity?.type ?? activity?.metadata?.type ?? null,
-      workflowMode: LOCAL_GM_SPELL_WORKFLOW_MODE,
-      attemptedMethod: "item.use",
-      isGM: Boolean(game.user?.isGM),
-      monitorRegistrationPath: "local-gm-preUseActivity",
-      sourceActor: serializeActor(participants.sourceActor),
-      sourceToken: serializeToken(participants.sourceToken),
-      targets: participants.targets.map(serializeToken),
-      spellWorkflowProbe
-    });
-  });
-
-  Hooks.on("midi-qol.AttackRollComplete", (workflow) => {
-    logInfo("Remote Action AOE hook callback entered.", buildAoeHookEntryLogData(workflow, "midi-qol.AttackRollComplete"));
-    observeAoeHookWorkflow(workflow, "midi-qol.AttackRollComplete");
-  });
-
-  Hooks.on("midi-qol.RollComplete", (workflow) => {
-    logInfo("Remote Action AOE hook callback entered.", buildAoeHookEntryLogData(workflow, "midi-qol.RollComplete"));
-    const activityUuid = workflow?.activity?.uuid ?? null;
-    if (!activityUuid) return;
-    observeAoeHookWorkflow(workflow, "midi-qol.RollComplete");
-
-
-    const executionMetadata = getRemoteActionExecutionMetadata(workflow);
-    if (executionMetadata.remoteActionExecution) {
-      logDebug("Remote Action AOE diagnostic at midi-qol.RollComplete.", {
-        ...buildAoeDiagnosticLogData({
-          item: workflow?.item ?? null,
-          launchedActivity: workflow?.activity ?? null,
-          workflow,
-          stage: "midi-qol.RollComplete",
-          nativeExecutionPath: executionMetadata.remoteActionExecutionMode?.includes(":activity.use")
-            ? "activity.use"
-            : executionMetadata.remoteActionExecutionMode?.includes("item.use")
-              ? "item.use"
-              : null,
-          workflowMode: executionMetadata.remoteActionExecutionMode ?? null,
-          executionMode: executionMetadata.remoteActionExecutionMode ?? null
-        }),
-        remoteActionExecution: executionMetadata.remoteActionExecution,
-        remoteActionExecutionMode: executionMetadata.remoteActionExecutionMode,
-        remoteActionItemCardUuid: executionMetadata.itemCardUuid,
-        workflowSummary: summarizeMidiWorkflow(workflow)
-      });
-    }
-
-    const existingMonitor = LOCAL_GM_SPELL_WORKFLOW_MONITORS.get(activityUuid);
-    if (!existingMonitor) return;
-
-    clearTimeout(existingMonitor.timeoutId);
-    existingMonitor.monitor.cleanup();
-    LOCAL_GM_SPELL_WORKFLOW_MONITORS.delete(activityUuid);
-  });
-
-  Hooks.on("dnd5e.postUseActivity", (activity) => {
-    const activityUuid = activity?.uuid ?? null;
-    if (!activityUuid) return;
-
-    const existingMonitor = LOCAL_GM_SPELL_WORKFLOW_MONITORS.get(activityUuid);
-    if (!existingMonitor) return;
-
-    setTimeout(() => {
-      const stillRegisteredMonitor = LOCAL_GM_SPELL_WORKFLOW_MONITORS.get(activityUuid);
-      if (!stillRegisteredMonitor) return;
-      if (
-        stillRegisteredMonitor.monitor.state.saveWorkflowStarted
-        || stillRegisteredMonitor.monitor.state.damageWorkflowStarted
-        || stillRegisteredMonitor.monitor.state.finalResult
-      ) {
-        return;
-      }
-
-      logDebug("Local GM spell workflow comparison monitor is still waiting after postUseActivity.", {
-        activityUuid,
-        workflowMode: LOCAL_GM_SPELL_WORKFLOW_MODE,
-        monitorState: stillRegisteredMonitor.monitor.state
-      });
-    }, 500);
-  });
-
-  logInfo("Remote Action AOE hook observers registered.", {
-    currentUserId: game.user?.id ?? null,
-    currentUserName: game.user?.name ?? null,
-    isGM: Boolean(game.user?.isGM),
-    registeredHooks: [
-      "midi-qol.AttackRollComplete",
-      "midi-qol.RollComplete"
-    ]
-  });
-
-  logDebug("Remote Action local GM spell workflow comparison hooks registered.", {
-    currentUserId: game.user?.id ?? null,
-    currentUserName: game.user?.name ?? null,
-    isGM: Boolean(game.user?.isGM),
-    monitorRegistrationPath: "ready-gm-register",
-    moduleEnvironment: getSpellWorkflowModuleEnvironment()
-  });
-}
-
 async function startMidiAutoHitActivityWorkflow(item, activity, participants, options = {}) {
   const {
-    workflowMode = MANUAL_HIT_WORKFLOW_MODE,
+    workflowMode = AUTO_HIT_WORKFLOW_MODE,
     workflowSettings = getWorkflowSettings(),
     midiApi = getMidiQolApi()
   } = options;
@@ -3443,7 +3281,7 @@ async function startMidiAutoHitActivityWorkflow(item, activity, participants, op
 }
 async function startDnd5eDamageOnlyWorkflow(item, activity, participants, options = {}) {
   const {
-    workflowMode = MANUAL_HIT_WORKFLOW_MODE,
+    workflowMode = AUTO_HIT_WORKFLOW_MODE,
     isCritical = false,
     midiApi = getMidiQolApi()
   } = options;
@@ -3506,7 +3344,7 @@ async function startDnd5eDamageOnlyWorkflow(item, activity, participants, option
   }
 
   if (!midiAvailable) {
-    logDebug("Midi-QOL not available for manual-hit workflow, using dnd5e fallback.", {
+    logDebug("Midi-QOL not available for auto-hit workflow, using dnd5e fallback.", {
       itemUuid: item.uuid,
       itemName: item.name,
       activityName: activitySummary.activityName,
@@ -3812,8 +3650,16 @@ async function startExplicitActivityUseWorkflow(item, activity, participants, br
   participants = normalizeWorkflowParticipants(participants);
   const workflowSettings = options?.workflowSettings ?? getWorkflowSettings();
   const midiApi = options?.midiApi ?? getMidiQolApi();
+  const actingUserId = options?.actingUserId ?? bridgePayload?.context?.actingUserId ?? bridgePayload?.context?.senderUserId ?? null;
+  const rollModeRequestScopeId = options?.requestScopeId
+    ?? bridgePayload?.context?.rollModeRequestScopeId
+    ?? bridgePayload?.context?.relayRequestSentAt
+    ?? null;
   const workflowClassification = options?.workflowClassification
-    ?? classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+    ?? classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi, {
+      actingUserId,
+      rollModeRequestScopeId
+    });
   const {
     usagePayload,
     dialogConfig,
@@ -3823,14 +3669,16 @@ async function startExplicitActivityUseWorkflow(item, activity, participants, br
     } = buildExplicitActivityExecutionConfig(bridgePayload);
   const activitySummary = getActivitySummary(activity, usagePayload);
 
-  if (workflowClassification.strategy === "midi-auto-hit") {
-    logDebug("Explicit remote activity workflow routed to Midi auto-hit workflow branch.", {
+  if (
+    workflowClassification.strategy === "midi-auto-hit"
+  ) {
+    logDebug("Explicit remote activity workflow routed to Midi workflow branch.", {
       itemUuid: item?.uuid ?? null,
       itemName: item?.name ?? null,
       activityUuid: activity?.uuid ?? bridgePayload?.activityUuid ?? null,
       activityName: activitySummary.activityName,
       activityType: activitySummary.activityType,
-      workflowMode: MANUAL_HIT_WORKFLOW_MODE,
+      workflowMode: AUTO_HIT_WORKFLOW_MODE,
       actionFamily: workflowClassification.actionFamily,
       strategy: workflowClassification.strategy,
       aoeSecondaryExecution,
@@ -4070,7 +3918,7 @@ async function startExplicitActivityUseWorkflow(item, activity, participants, br
     ...activitySummary
   };
 }
-async function startDnd5eItemUsageWorkflow(item) {
+async function startDnd5eItemUsageWorkflow(item, request = {}) {
   if (!item) {
     return {
       ok: false,
@@ -4134,6 +3982,8 @@ async function startDnd5eItemUsageWorkflow(item) {
     : [];
   const activity = activities[0] ?? null;
   const workflowSettings = getWorkflowSettings();
+  const actingUserId = request?.senderUserId ?? game.user?.id ?? null;
+  const rollModeRequestScopeId = request?.sentAt ?? request?.payload?.context?.rollModeRequestScopeId ?? null;
   const participants = normalizeWorkflowParticipants(getWorkflowParticipants(item));
   const midiApi = getMidiQolApi();
   const midiAvailable = Boolean(midiApi?.DamageOnlyWorkflow);
@@ -4164,7 +4014,10 @@ async function startDnd5eItemUsageWorkflow(item) {
     };
   }
 
-  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi, {
+    actingUserId,
+    rollModeRequestScopeId
+  });
 
   logDebug("Remote activity workflow classified.", {
     itemUuid: item.uuid,
@@ -4484,7 +4337,7 @@ async function startDnd5eItemUsageWorkflow(item) {
     strategy: workflowClassification.strategy,
     requiresDialog: activitySummary.requiresDialog,
     directWorkflow: launchMode === "direct-workflow",
-    expectsManualUseClick: true,
+    expectsUseClick: true,
     workflowLinkedToExecution: true,
     expectedSubmitHandler: launchMode === "dialog"
       ? `dnd5e ActivityUsageDialog form handler via ${attemptedMethod}`
@@ -4722,8 +4575,13 @@ async function handleRelayActivityUseAction(request) {
 
   const participants = await resolveExplicitWorkflowParticipants(item, payload);
   const workflowSettings = getWorkflowSettings();
+  const actingUserId = request?.senderUserId ?? payload?.context?.actingUserId ?? null;
+  const rollModeRequestScopeId = request?.sentAt ?? payload?.context?.rollModeRequestScopeId ?? null;
   const midiApi = getMidiQolApi();
-  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi);
+  const workflowClassification = classifyRemoteActivityWorkflow(item, activity, workflowSettings, midiApi, {
+    actingUserId,
+    rollModeRequestScopeId
+  });
 
   logDebug("Executing explicit remote activity bridge workflow.", {
     actionType,
@@ -4737,6 +4595,8 @@ async function handleRelayActivityUseAction(request) {
     sourceResolution: participants.sourceResolution,
     targets: participants.targets.map(serializeToken),
     actionFamily: workflowClassification.actionFamily,
+    actingUserId,
+    rollModeRequestScopeId,
     strategy: "explicit-activity-use",
     requiresDialog: workflowClassification.requiresDialog,
     aoeSecondaryExecution: payload.aoeSecondaryExecution,
@@ -4746,7 +4606,9 @@ async function handleRelayActivityUseAction(request) {
   const workflowResult = await startExplicitActivityUseWorkflow(item, activity, participants, payload, {
     workflowClassification,
     workflowSettings,
-    midiApi
+    midiApi,
+    actingUserId,
+    requestScopeId: rollModeRequestScopeId
   });
 
   if (!workflowResult.ok) {
@@ -4873,7 +4735,7 @@ async function handleOpenItemUseDialogAction(request) {
     ]);
   }
 
-  const workflowResult = await startDnd5eItemUsageWorkflow(document);
+  const workflowResult = await startDnd5eItemUsageWorkflow(document, request);
 
   if (!workflowResult.ok) {
     logDebug("Failed to start dnd5e item usage workflow cleanly.", {
@@ -4930,7 +4792,7 @@ async function handleOpenItemUseDialogAction(request) {
     };
   }
 
-  const message = workflowResult.workflowMode === MANUAL_HIT_WORKFLOW_MODE
+  const message = workflowResult.workflowMode === AUTO_HIT_WORKFLOW_MODE
     ? workflowResult.midiUsed
       ? "Remote Action started a Midi-QOL complete auto-hit workflow on the receiver."
       : "Remote Action started an auto-hit workflow on the receiver."
@@ -4987,10 +4849,10 @@ async function handleOpenItemUseDialogAction(request) {
     saveWorkflowStarted: workflowResult.saveWorkflowStarted ?? false,
     damageWorkflowStarted: workflowResult.damageWorkflowStarted ?? false,
     finalResult: workflowResult.finalResult ?? null,
-    workflowLinkedToExecution: workflowResult.workflowMode === MANUAL_HIT_WORKFLOW_MODE
+    workflowLinkedToExecution: workflowResult.workflowMode === AUTO_HIT_WORKFLOW_MODE
       ? Boolean(workflowResult.damageRolled)
       : true,
-    expectsManualUseClick: workflowResult.workflowMode === MANUAL_HIT_WORKFLOW_MODE
+    expectsUseClick: workflowResult.workflowMode === AUTO_HIT_WORKFLOW_MODE
       ? false
       : true
   });

@@ -1,5 +1,4 @@
 import { logDebug } from "./debug.js";
-import { RemoteActionUserConfigApplication } from "./config-application.js";
 
 export const MODULE_ID = "remote-action";
 
@@ -51,15 +50,6 @@ export function stringifyAuthorizedSenderIds(userIds) {
 }
 
 export function registerSettings() {
-  game.settings.registerMenu(MODULE_ID, "userConfiguration", {
-    name: "REMOTE_ACTION.Settings.UserConfiguration.Name",
-    hint: "REMOTE_ACTION.Settings.UserConfiguration.Hint",
-    label: "REMOTE_ACTION.Settings.UserConfiguration.Label",
-    icon: "fas fa-users-cog",
-    type: RemoteActionUserConfigApplication,
-    restricted: true
-  });
-
   game.settings.register(MODULE_ID, SETTING_KEYS.PRIMARY_RECEIVER, {
     name: "REMOTE_ACTION.Settings.PrimaryReceiver.Name",
     hint: "REMOTE_ACTION.Settings.PrimaryReceiver.Hint",
@@ -144,6 +134,20 @@ export function registerSettings() {
     type: Boolean,
     default: true,
     requiresReload: false
+  });
+
+}
+
+export function registerUserConfigurationMenu(RemoteActionUserConfigApplication) {
+  if (!RemoteActionUserConfigApplication) return;
+
+  game.settings.registerMenu(MODULE_ID, "userConfiguration", {
+    name: "REMOTE_ACTION.Settings.UserConfiguration.Name",
+    hint: "REMOTE_ACTION.Settings.UserConfiguration.Hint",
+    label: "REMOTE_ACTION.Settings.UserConfiguration.Label",
+    icon: "fas fa-users-cog",
+    type: RemoteActionUserConfigApplication,
+    restricted: true
   });
 }
 

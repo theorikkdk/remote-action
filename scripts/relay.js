@@ -435,7 +435,7 @@ export function debugConfig() {
   const socketAvailable = Boolean(getRemoteActionSocket());
   const recommendedTableModeActive = !snapshot.workflowSettings.useAttackRolls && snapshot.workflowSettings.useDamageRolls;
   const currentWorkflowProfile = recommendedTableModeActive
-    ? "recommended-manual-hit-foundry-damage"
+    ? "recommended-auto-hit-foundry-damage"
     : snapshot.workflowSettings.useAttackRolls
       ? "native-foundry-attack-experimental"
       : "custom-workflow-profile";

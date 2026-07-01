@@ -1,24 +1,49 @@
-import { MODULE_ID, registerSettings } from "./settings.js";
-import { registerSocket } from "./socket.js";
-import { registerUiHooks } from "./ui-hooks.js";
-import { debugConfig, pingRelay, relayAction, relayActivityUse, sendAction } from "./relay.js";
+import { MODULE_ID, registerSettings, registerUserConfigurationMenu } from "./settings.js";
 import { logDebug, logInfo, logWarning } from "./debug.js";
-import { registerSecondaryAoeActivityObservers, registerSpellWorkflowComparisonHooks } from "./execute.js";
 
-const REMOTE_ACTION_BUILD_FINGERPRINT = "2026-03-31-activity-use-wrapper-aoe-compat-01";
+const REMOTE_ACTION_BUILD_FINGERPRINT = "2026-07-01-clean-roll-modes-01";
+let runtimeModulesPromise = null;
+
+function loadRuntimeModules() {
+  if (!runtimeModulesPromise) {
+    runtimeModulesPromise = Promise.all([
+      import("./socket.js"),
+      import("./ui-hooks.js"),
+      import("./relay.js"),
+      import("./execute.js")
+    ]).then(([socket, uiHooks, relay, execute]) => ({
+      socket,
+      uiHooks,
+      relay,
+      execute
+    }));
+  }
+
+  return runtimeModulesPromise;
+}
+
+function logRuntimeLoadError(stage, error) {
+  logWarning("Remote Action runtime modules could not be loaded.", {
+    stage,
+    message: error?.message ?? String(error),
+    stack: error?.stack ?? null
+  });
+}
 
 function logModuleFingerprint(stage) {
   const module = game.modules.get(MODULE_ID);
-
-  logDebug("Remote Action module fingerprint.", {
+  const payload = {
     stage,
     moduleId: MODULE_ID,
     moduleVersion: module?.version ?? null,
     buildFingerprint: REMOTE_ACTION_BUILD_FINGERPRINT,
     systemId: game.system?.id ?? null,
     currentUserId: game.user?.id ?? null,
-    currentUserName: game.user?.name ?? null
-  });
+    currentUserName: game.user?.name ?? null,
+    isGM: Boolean(game.user?.isGM)
+  };
+
+  logDebug("Remote Action module fingerprint.", payload);
 }
 
 Hooks.once("init", () => {
@@ -30,48 +55,79 @@ Hooks.once("init", () => {
   }
 
   registerSettings();
-  registerUiHooks();
 
-  const module = game.modules.get(MODULE_ID);
-  if (module) {
-    module.api = {
-      debugConfig,
-      pingRelay,
-      relayAction,
-      relayActivityUse,
-      sendAction
-    };
-  }
+  import("./config-application.js")
+    .then(({ RemoteActionUserConfigApplication }) => {
+      registerUserConfigurationMenu(RemoteActionUserConfigApplication);
+      logDebug("User configuration settings menu registered.");
+    })
+    .catch((error) => {
+      logWarning("User configuration settings menu could not be registered.", {
+        message: error?.message ?? String(error),
+        stack: error?.stack ?? null
+      });
+    });
+
+  loadRuntimeModules()
+    .then(({ uiHooks, relay }) => {
+      uiHooks.registerUiHooks();
+
+      const module = game.modules.get(MODULE_ID);
+      if (module) {
+        module.api = {
+          debugConfig: relay.debugConfig,
+          pingRelay: relay.pingRelay,
+          relayAction: relay.relayAction,
+          relayActivityUse: relay.relayActivityUse,
+          sendAction: relay.sendAction
+        };
+      }
+    })
+    .catch((error) => {
+      logRuntimeLoadError("init", error);
+    });
 });
 
 Hooks.once("setup", () => {
-  registerSocket();
-  logDebug("Setup complete.");
+  loadRuntimeModules()
+    .then(({ socket }) => {
+      socket.registerSocket();
+      logDebug("Setup complete.");
+    })
+    .catch((error) => {
+      logRuntimeLoadError("setup", error);
+    });
 });
 
 Hooks.once("ready", () => {
-  game.remoteAction = {
-    debugConfig,
-    pingRelay,
-    relayAction,
-    relayActivityUse,
-    sendAction
-  };
+  loadRuntimeModules()
+    .then(({ relay, execute }) => {
+      game.remoteAction = {
+        debugConfig: relay.debugConfig,
+        pingRelay: relay.pingRelay,
+        relayAction: relay.relayAction,
+        relayActivityUse: relay.relayActivityUse,
+        sendAction: relay.sendAction
+      };
 
-  registerSecondaryAoeActivityObservers();
+      execute.registerSecondaryAoeActivityObservers();
 
-  if (game.user?.isGM) {
-    registerSpellWorkflowComparisonHooks();
-  } else {
-    logDebug("Remote Action local GM spell workflow comparison hooks skipped from main ready on non-GM client.", {
-      currentUserId: game.user?.id ?? null,
-      currentUserName: game.user?.name ?? null,
-      isGM: Boolean(game.user?.isGM),
-      monitorRegistrationPath: "main-ready-skip-non-gm",
-      note: "Remote Action ignores non-GM comparison hooks on this client so TouchVTT and MidiItem note errors stay outside the spell workflow diagnosis."
+      if (game.user?.isGM) {
+        execute.registerSpellWorkflowComparisonHooks();
+      } else {
+        logDebug("Remote Action local GM spell workflow comparison hooks skipped from main ready on non-GM client.", {
+          currentUserId: game.user?.id ?? null,
+          currentUserName: game.user?.name ?? null,
+          isGM: Boolean(game.user?.isGM),
+          monitorRegistrationPath: "main-ready-skip-non-gm",
+          note: "Remote Action ignores non-GM comparison hooks on this client so TouchVTT and MidiItem note errors stay outside the spell workflow diagnosis."
+        });
+      }
+      logModuleFingerprint("ready");
+      logDebug("Console API exposed on game.remoteAction.");
+      logDebug("Ready.");
+    })
+    .catch((error) => {
+      logRuntimeLoadError("ready", error);
     });
-  }
-  logModuleFingerprint("ready");
-  logDebug("Console API exposed on game.remoteAction.");
-  logDebug("Ready.");
 });
